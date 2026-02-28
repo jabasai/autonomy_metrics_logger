@@ -156,18 +156,25 @@ Logic when active:
 | -------------------------- | ------ | ------- | --------------------------------------------------------------------------------------------- |
 | `collision_nav_threshold`  | double | `0.01`  | `/cmd_vel/nav.linear.x` must be > this to count as a forward command.                         |
 | `collision_zero_threshold` | double | `0.001` | `/cmd_vel/collision.linear.x` considered zero if abs(x) ≤ this.                               |
+| `collision_moving_threshold` | double | `0.03` | `/cmd_vel/collision.linear.x` considered moving if abs(x) ≥ this (hysteresis upper bound).    |
+| `collision_zero_required_count` | int | `2` | Require this many consecutive near-zero collision samples before counting a collision.         |
 | `collision_time_window`    | double | `0.5`   | Nav and collision commands must both be within this time window (s).                          |
-| `collision_log_cooldown`   | double | `1.0`   | Optional legacy cooldown between collisions (can be unused if using pure falling-edge logic). |
+| `collision_log_cooldown`   | double | `1.0`   | Minimum time between logged collision events.                                                  |
+| `intervention_event_cooldown` | double | `1.0` | Default cooldown for YAML `intervention_on_message` triggers.                                 |
 
-Collision detection (falling-edge):
+Collision detection (robust falling-edge):
 
 * Keep last `/cmd_vel/nav` and `/cmd_vel/collision`.
 * Compute a collision **only when**:
 
-  * Previous `/cmd_vel/collision.linear.x` had velocity (`> collision_zero_threshold`),
-  * Current `/cmd_vel/collision.linear.x` is ~0,
+  * Current mode is `Autonomous`,
+  * Previous collision stream state was moving (`>= collision_moving_threshold`),
+  * Current collision stream is near-zero (`<= collision_zero_threshold`) for `collision_zero_required_count` consecutive samples,
   * Latest `/cmd_vel/nav.linear.x` > `collision_nav_threshold`,
   * Commands are recent (`≤ collision_time_window`).
+* Additional safeguard:
+
+  * Events are rate-limited by `collision_log_cooldown`.
 * On collision:
 
   * `collision_incidents` is incremented,
@@ -244,6 +251,11 @@ topics:
     intervention_on_message:
       enable: true
       event_type: "Joy_override"
+      require_autonomous_mode: true
+      on_rising_edge: true
+      cooldown_sec: 1.0
+      activity_field: "linear.x"
+      min_abs_value: 0.02
 
   - name: "/cmd_vel/collision_smoothed"
     type: "geometry_msgs/msg/Twist"
@@ -370,9 +382,22 @@ Per-topic:
   intervention_on_message:
     enable: true
     event_type: "Joy_override"
+    require_autonomous_mode: true
+    on_rising_edge: true
+    cooldown_sec: 1.0
+    activity_field: "linear.x"
+    min_abs_value: 0.02
   ```
 
-  If enabled, **every message** on that topic triggers an event of this type via `trigger_intervention`.
+  If enabled, events are emitted only when trigger conditions pass:
+
+  * `require_autonomous_mode` (default `true`): skip in Manual mode.
+  * `on_rising_edge` (default `true`): trigger only on inactive→active transition.
+  * `cooldown_sec` (default from node param `intervention_event_cooldown`): per-trigger rate limit.
+  * `activity_field` (default `linear.x`): field used to determine activity.
+  * `min_abs_value`: minimum absolute value for numeric activity fields.
+
+  This avoids noisy per-message logs and false overrides from zero/idle commands.
 
 * `intervention_on_change`:
 
@@ -408,8 +433,31 @@ Per-topic:
 
 * E-stop, faults, joy overrides, etc. in **Manual** mode:
 
-  * Are logged to DB (event + snapshot),
+  * Are suppressed by default for intervention triggers,
+  * Can still be explicitly logged for critical events (e.g. E-stop),
   * Do **not** increment `incidents`, thus do not affect MDBI.
+
+### Recommended anti-noise presets
+
+Simulation (cleaner signals):
+
+* `mode_observer_speed_threshold: 0.01`
+* `collision_nav_threshold: 0.01`
+* `collision_zero_threshold: 0.001`
+* `collision_moving_threshold: 0.02`
+* `collision_zero_required_count: 2`
+* `collision_log_cooldown: 0.6`
+* `intervention_event_cooldown: 0.8`
+
+Real robot (noisier signals):
+
+* `mode_observer_speed_threshold: 0.02`
+* `collision_nav_threshold: 0.03`
+* `collision_zero_threshold: 0.01`
+* `collision_moving_threshold: 0.05`
+* `collision_zero_required_count: 3`
+* `collision_log_cooldown: 1.5`
+* `intervention_event_cooldown: 1.5`
 
 ---
 
@@ -452,8 +500,11 @@ def generate_launch_description():
             'mode_observer_speed_threshold': LaunchConfiguration('mode_observer_speed_threshold'),
             'collision_nav_threshold': LaunchConfiguration('collision_nav_threshold'),
             'collision_zero_threshold': LaunchConfiguration('collision_zero_threshold'),
+            'collision_moving_threshold': LaunchConfiguration('collision_moving_threshold'),
+            'collision_zero_required_count': LaunchConfiguration('collision_zero_required_count'),
             'collision_time_window': LaunchConfiguration('collision_time_window'),
             'collision_log_cooldown': LaunchConfiguration('collision_log_cooldown'),
+            'intervention_event_cooldown': LaunchConfiguration('intervention_event_cooldown'),
         }],
     )
 

@@ -115,13 +115,19 @@ class AutonomyMetricsLogger(Node):
         # Collision detection tuning
         self.declare_parameter('collision_nav_threshold', 0.01)      # nav cmd must be > this
         self.declare_parameter('collision_zero_threshold', 0.001)    # collision cmd abs(linear.x) <= this
+        self.declare_parameter('collision_moving_threshold', 0.03)   # collision cmd abs(linear.x) >= this to consider as "has velocity"
+        self.declare_parameter('collision_zero_required_count', 2)    # require N consecutive near-zero collision commands before logging
         self.declare_parameter('collision_time_window', 0.5)         # seconds: nav & collision cmds must be close in time
         self.declare_parameter('collision_log_cooldown', 1.0)        # seconds between logged collisions
+        self.declare_parameter('intervention_event_cooldown', 1.0)   # default cooldown for YAML intervention triggers
 
         self.collision_nav_threshold = self.get_parameter('collision_nav_threshold').get_parameter_value().double_value
         self.collision_zero_threshold = self.get_parameter('collision_zero_threshold').get_parameter_value().double_value
+        self.collision_moving_threshold = self.get_parameter('collision_moving_threshold').get_parameter_value().double_value
+        self.collision_zero_required_count = self.get_parameter('collision_zero_required_count').get_parameter_value().integer_value
         self.collision_time_window = self.get_parameter('collision_time_window').get_parameter_value().double_value
         self.collision_log_cooldown = self.get_parameter('collision_log_cooldown').get_parameter_value().double_value
+        self.intervention_event_cooldown = self.get_parameter('intervention_event_cooldown').get_parameter_value().double_value
         self.mode_observer_cmd_timeout = self.get_parameter('mode_observer_cmd_timeout').get_parameter_value().double_value
         self.mode_observer_speed_threshold = self.get_parameter('mode_observer_speed_threshold').get_parameter_value().double_value
         self.config_path = self.get_parameter('config_yaml').get_parameter_value().string_value
@@ -136,7 +142,9 @@ class AutonomyMetricsLogger(Node):
         self.get_logger().info(f"Config path: {self.config_path}")
         self.get_logger().info(
             f"Collision params: nav_thr={self.collision_nav_threshold}, "
-            f"zero_thr={self.collision_zero_threshold}, time_window={self.collision_time_window}"
+            f"zero_thr={self.collision_zero_threshold}, moving_thr={self.collision_moving_threshold}, "
+            f"zero_required={self.collision_zero_required_count}, time_window={self.collision_time_window}, "
+            f"cooldown={self.collision_log_cooldown}"
         )
 
         # DB Managers
@@ -172,6 +180,7 @@ class AutonomyMetricsLogger(Node):
         # Collision monitoring
         self.collision_incidents = 0
         self.collision_prev_has_velocity = False  # for falling-edge detection
+        self.collision_zero_streak = 0
 
         self.last_nav_cmd = None
         self.last_nav_time = None
@@ -187,6 +196,8 @@ class AutonomyMetricsLogger(Node):
 
         # Snapshot of latest values per field for change detection
         self.prev_field_values = {}
+        self.prev_message_trigger_active = {}
+        self.last_intervention_event_time = {}
 
         # Current battery level (updated from any topic with 'battery_field')
         self.current_battery = None
@@ -352,7 +363,13 @@ class AutonomyMetricsLogger(Node):
             metrics["battery_percentage"] = self.current_battery
         return metrics
 
-    def trigger_intervention(self, event_type: str, extra: dict | None = None, force_count: bool = False):
+    def trigger_intervention(
+        self,
+        event_type: str,
+        extra: dict | None = None,
+        force_count: bool = False,
+        log_when_not_counted: bool = False,
+    ):
         """
         Log an intervention-type event.
 
@@ -368,6 +385,12 @@ class AutonomyMetricsLogger(Node):
 
         if count_incident:
             self.incidents += 1
+        elif not log_when_not_counted:
+            self.get_logger().debug(
+                f"[Intervention] Suppressed event '{event_type}' in mode={current_mode} "
+                "(not counted and log_when_not_counted=False)."
+            )
+            return
 
         self.get_logger().info(
             f"[Intervention] type={event_type}, mode={current_mode}, "
@@ -380,20 +403,84 @@ class AutonomyMetricsLogger(Node):
 
         self.log_event(event_type, base_details)
 
-    def handle_intervention_triggers(self, topic_name: str, data: dict, cfg: dict):
+    def handle_intervention_triggers(self, topic_name: str, msg, data: dict, cfg: dict):
         """
         Apply YAML-configured triggers for this topic.
         - intervention_on_message: triggers on any message
         - intervention_on_change[field]: triggers when selected field changes
         """
-        # 1) Trigger on any message (e.g. /cmd_vel/joy)
+        now = self.get_clock().now()
+
+        # 1) Trigger on message activity (e.g. /cmd_vel/joy)
         msg_trig = cfg.get("intervention_on_message", {})
         if msg_trig.get("enable", False):
             evt_type = msg_trig.get("event_type", f"{topic_name}_activity")
-            self.get_logger().info(
-                f"[Trigger] intervention_on_message on topic '{topic_name}' -> event '{evt_type}'"
-            )
-            self.trigger_intervention(evt_type, extra={"topic": topic_name})
+            require_auto = msg_trig.get("require_autonomous_mode", True)
+            on_rising_edge = msg_trig.get("on_rising_edge", True)
+            cooldown_sec = float(msg_trig.get("cooldown_sec", self.intervention_event_cooldown))
+
+            activity_field = msg_trig.get("activity_field", "linear.x")
+            min_abs_cfg = msg_trig.get("min_abs_value", None)
+            if min_abs_cfg is None:
+                if activity_field.startswith("linear.") or activity_field.startswith("angular."):
+                    min_abs_value = float(self.mode_observer_speed_threshold)
+                else:
+                    min_abs_value = 0.0
+            else:
+                min_abs_value = float(min_abs_cfg)
+
+            activity_value = None
+            try:
+                activity_value = get_nested_field(msg, activity_field)
+            except Exception:
+                if "data" in data:
+                    activity_value = data["data"]
+
+            if isinstance(activity_value, bool):
+                is_active = activity_value
+            elif isinstance(activity_value, (int, float)):
+                is_active = abs(float(activity_value)) >= min_abs_value
+            elif activity_value is None:
+                # If we cannot evaluate activity, treat any message as activity.
+                is_active = True
+            else:
+                is_active = bool(activity_value)
+
+            trig_key = (topic_name, evt_type)
+            prev_active = self.prev_message_trigger_active.get(trig_key, False)
+            self.prev_message_trigger_active[trig_key] = is_active
+
+            current_mode = self.details.get('operation_mode', self.MAN)
+            if require_auto and current_mode != self.AUTO:
+                self.get_logger().debug(
+                    f"[Trigger] Skip '{evt_type}' on '{topic_name}' because mode={current_mode}"
+                )
+            else:
+                should_fire = is_active and (not on_rising_edge or not prev_active)
+                if should_fire:
+                    last_event_time = self.last_intervention_event_time.get(trig_key)
+                    if last_event_time is not None:
+                        dt = (now - last_event_time).nanoseconds * 1e-9
+                        if dt < cooldown_sec:
+                            should_fire = False
+                            self.get_logger().debug(
+                                f"[Trigger] Cooldown active for '{evt_type}' ({dt:.3f}s < {cooldown_sec:.3f}s)"
+                            )
+
+                if should_fire:
+                    self.last_intervention_event_time[trig_key] = now
+                    self.get_logger().info(
+                        f"[Trigger] message_activity on '{topic_name}' -> event '{evt_type}', "
+                        f"value={activity_value}, active={is_active}"
+                    )
+                    self.trigger_intervention(
+                        evt_type,
+                        extra={
+                            "topic": topic_name,
+                            "activity_field": activity_field,
+                            "activity_value": activity_value,
+                        },
+                    )
 
         # 2) Trigger on change of specific fields
         field_trigs = cfg.get("intervention_on_change", {})
@@ -404,8 +491,13 @@ class AutonomyMetricsLogger(Node):
             key = (topic_name, field_name)
             prev = self.prev_field_values.get(key)
             new = data[field_name]
-            changed = (prev is None) or (prev != new)
             self.prev_field_values[key] = new
+
+            # First sample establishes baseline; don't emit a change event on startup.
+            if prev is None:
+                continue
+
+            changed = (prev != new)
 
             if not changed:
                 continue
@@ -561,7 +653,7 @@ class AutonomyMetricsLogger(Node):
             self.get_logger().info(f"E-Stop state changed: {v}")
             if v:
                 # E-stop counts as intervention
-                self.trigger_intervention('EMS')
+                self.trigger_intervention('EMS', log_when_not_counted=True)
 
     def generic_callback(self, topic_name, msg, log_fields):
         cfg = self.topic_cfg_map.get(topic_name, {})
@@ -612,7 +704,7 @@ class AutonomyMetricsLogger(Node):
                     )
 
         # Apply YAML-configured intervention triggers (message & field-change)
-        self.handle_intervention_triggers(topic_name, data, cfg)
+        self.handle_intervention_triggers(topic_name, msg, data, cfg)
 
         # Dynamic republishing if configured
         self.handle_dynamic_publish(topic_name, msg)
@@ -784,13 +876,27 @@ class AutonomyMetricsLogger(Node):
         We only increment again if the cycle repeats:
           velocity on /cmd_vel/collision -> zero -> velocity -> zero -> ...
         """
+        # Only count collisions while the robot is in autonomous mode.
+        if self.details.get('operation_mode') != self.AUTO:
+            collision_abs_vx = abs(coll_vx_now)
+            if collision_abs_vx >= self.collision_moving_threshold:
+                self.collision_prev_has_velocity = True
+            elif collision_abs_vx <= self.collision_zero_threshold:
+                self.collision_prev_has_velocity = False
+            self.collision_zero_streak = 0
+            return
+
         # Need a nav command to interpret the collision behaviour
         if self.last_nav_cmd is None or self.last_nav_time is None:
             self.get_logger().debug(
                 "[Collision] No NAV cmd yet; cannot evaluate collision condition."
             )
-            collision_has_velocity_now = abs(coll_vx_now) > self.collision_zero_threshold
-            self.collision_prev_has_velocity = collision_has_velocity_now
+            collision_abs_vx = abs(coll_vx_now)
+            if collision_abs_vx >= self.collision_moving_threshold:
+                self.collision_prev_has_velocity = True
+            elif collision_abs_vx <= self.collision_zero_threshold:
+                self.collision_prev_has_velocity = False
+            self.collision_zero_streak = 0
             return
 
         # Check nav recency
@@ -800,8 +906,12 @@ class AutonomyMetricsLogger(Node):
                 f"[Collision] NAV cmd too old ({dt_nav:.3f}s > {self.collision_time_window}s); "
                 "skipping collision evaluation."
             )
-            collision_has_velocity_now = abs(coll_vx_now) > self.collision_zero_threshold
-            self.collision_prev_has_velocity = collision_has_velocity_now
+            collision_abs_vx = abs(coll_vx_now)
+            if collision_abs_vx >= self.collision_moving_threshold:
+                self.collision_prev_has_velocity = True
+            elif collision_abs_vx <= self.collision_zero_threshold:
+                self.collision_prev_has_velocity = False
+            self.collision_zero_streak = 0
             return
 
         nav_vx = float(self.last_nav_cmd.linear.x)
@@ -812,31 +922,57 @@ class AutonomyMetricsLogger(Node):
                 f"[Collision] NAV vx={nav_vx:.3f} <= nav_threshold={self.collision_nav_threshold}; "
                 "no forward motion requested."
             )
-            collision_has_velocity_now = abs(coll_vx_now) > self.collision_zero_threshold
-            self.collision_prev_has_velocity = collision_has_velocity_now
+            collision_abs_vx = abs(coll_vx_now)
+            if collision_abs_vx >= self.collision_moving_threshold:
+                self.collision_prev_has_velocity = True
+            elif collision_abs_vx <= self.collision_zero_threshold:
+                self.collision_prev_has_velocity = False
+            self.collision_zero_streak = 0
             return
 
-        # Edge detection on /cmd_vel/collision
-        collision_has_velocity_now = abs(coll_vx_now) > self.collision_zero_threshold
+        # Hysteresis-based state on /cmd_vel/collision
+        collision_abs_vx = abs(coll_vx_now)
+        collision_is_zero_now = collision_abs_vx <= self.collision_zero_threshold
+        collision_has_velocity_now = collision_abs_vx >= self.collision_moving_threshold
 
         self.get_logger().debug(
             f"[Collision] prev_has_vel={self.collision_prev_has_velocity}, "
-            f"now_has_vel={collision_has_velocity_now}, coll_vx_now={coll_vx_now:.3f}, "
-            f"nav_vx={nav_vx:.3f}"
+            f"now_has_vel={collision_has_velocity_now}, now_is_zero={collision_is_zero_now}, "
+            f"coll_vx_now={coll_vx_now:.3f}, nav_vx={nav_vx:.3f}, zero_streak={self.collision_zero_streak}"
         )
 
-        # Falling edge: had velocity before, now ~zero
-        if self.collision_prev_has_velocity and not collision_has_velocity_now:
-            # This is one collision incident
+        if collision_has_velocity_now:
+            self.collision_prev_has_velocity = True
+            self.collision_zero_streak = 0
+            return
+
+        if not collision_is_zero_now:
+            # In hysteresis band; keep previous state and wait for clearer signal.
+            return
+
+        self.collision_zero_streak += 1
+
+        # Falling edge with debounce: had velocity before, now zero for N consecutive samples.
+        if self.collision_prev_has_velocity and self.collision_zero_streak >= int(self.collision_zero_required_count):
+            if self.last_collision_logged_time is not None:
+                dt_coll = (now - self.last_collision_logged_time).nanoseconds * 1e-9
+                if dt_coll < self.collision_log_cooldown:
+                    self.get_logger().debug(
+                        f"[Collision] Cooldown active ({dt_coll:.3f}s < {self.collision_log_cooldown:.3f}s); skip log."
+                    )
+                    self.collision_prev_has_velocity = False
+                    self.collision_zero_streak = 0
+                    return
+
             self.collision_incidents += 1
+            self.last_collision_logged_time = now
             self.get_logger().info(
                 f"[Collision] Detected collision incident #{self.collision_incidents} "
-                f"(nav_vx={nav_vx:.3f}, coll_vx_now={coll_vx_now:.3f})"
+                f"(nav_vx={nav_vx:.3f}, coll_vx_now={coll_vx_now:.3f}, zero_count={self.collision_zero_streak})"
             )
             self.log_collision_event()
-
-        # Update for next call
-        self.collision_prev_has_velocity = collision_has_velocity_now
+            self.collision_prev_has_velocity = False
+            self.collision_zero_streak = 0
 
     # -------------------------
     # Timer & Logging

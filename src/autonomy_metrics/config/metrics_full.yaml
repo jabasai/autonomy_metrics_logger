@@ -93,6 +93,11 @@ topics:
     intervention_on_message:
       enable: true
       event_type: "Joy_override"
+      require_autonomous_mode: true
+      on_rising_edge: true
+      cooldown_sec: 1.0
+      activity_field: "linear.x"
+      min_abs_value: 0.02
 
   # ---------------------------------------------------------
   # Collision monitor: nav vs collision-filtered velocity
