@@ -6,6 +6,10 @@
 - Logs interventions and collisions to MongoDB with a full snapshot of system state.
 - Is configured entirely via a YAML file (topics, fields, triggers, dynamic publishers).
 - Supports both explicit operation mode (`/gophar/operation_mode`) and inferred mode (odom + velocity).
+- Tracks navigation area (in-row / headland / row-entry) with per-area average speed.
+- Derives a high-level robot status (In-row, Headland, Row-entry, Paused due to obstacle, Held by picker).
+- Computes cross-track deviation from the global path.
+- Periodically logs a full system snapshot to MongoDB (`timer_event`, not counted as MDBI incident).
 
 ---
 
@@ -26,7 +30,8 @@ The node:
    - E-stop
    - Faults / joy overrides / other YAML triggers
    - Collisions (nav vs collision velocity)
-6. Each event stored in Mongo includes:
+6. Periodically logs a `timer_event` (default every 5 s) with the full system snapshot to MongoDB. These events are **not** counted as incidents and do **not** affect MDBI.
+7. Each event stored in Mongo includes:
    - `metrics` (distance, autonomous_distance, speed, battery)
    - `system_snapshot` (current values of all configured topics)
    - Event type & extra details.
@@ -128,6 +133,7 @@ All parameters are exposed through the launch file.
 | `enable_remote_logging`  | bool   | `false`       | Enable writes to remote MongoDB.                       |
 | `min_distance_threshold` | double | `0.2`         | Min odom step (m) required for distance update.        |
 | `stop_timeout`           | double | `2.0`         | Time (s) after last odom update before speed is set 0. |
+| `snapshot_timer_interval` | double | `5.0`        | Interval (s) between periodic `timer_event` snapshots logged to MongoDB. |
 
 ### Mode observer (fallback mode inference)
 
@@ -291,6 +297,24 @@ topics:
     type: "dynium_gophar_interfaces/msg/MotorStatus"
     log_all_fields: true
     log_fields: []
+
+  # Navigation area, execution UI, and global path
+  - name: "/robot_navigation_area"
+    type: "std_msgs/msg/String"
+    role: "navigation_area"
+    log_fields:
+      - "data"
+
+  - name: "/roboflow/execution_ui"
+    type: "std_msgs/msg/String"
+    role: "execution_ui"
+    log_fields:
+      - "data"
+
+  - name: "/plan"
+    type: "nav_msgs/msg/Path"
+    role: "global_path"
+    log_fields: []
 ```
 
 ### Per-topic keys
@@ -316,6 +340,9 @@ Common fields:
   * `"mode_observer"`: used by mode observer (e.g. `/cmd_vel/collision_smoothed`).
   * `"collision_nav"`: nav velocity command.
   * `"collision_output"`: collision-limited velocity command.
+  * `"navigation_area"`: navigation area enum (e.g. `/robot_navigation_area`).
+  * `"execution_ui"`: execution UI state (`idle` / `paused`, e.g. `/roboflow/execution_ui`).
+  * `"global_path"`: global planner path (`nav_msgs/msg/Path`) used for path-deviation error.
 
 * `log_fields` (list of dotted paths)
   Fields to extract into `system_snapshot[topic_name]`.
@@ -414,7 +441,66 @@ Per-topic:
 
 ---
 
-## 5. Mode Handling and Incidents
+## 5. Navigation Area, Status & Path Deviation
+
+These features are implemented in two modular tracker classes that are instantiated by the main node.
+
+### Navigation area tracking (`NavigationAreaTracker`)
+
+Subscribes (via `role: "navigation_area"`) to a topic publishing `std_msgs/msg/String` with one of:
+
+* `INSIDE_POLYTUNNEL`
+* `OUTSIDE_POLYTUNNEL`
+* `TRANSITION_INTO_POLYTUNNEL`
+
+Also monitors the execution UI topic (`role: "execution_ui"`) for values `idle` or `paused`.
+
+#### Published topics
+
+| Topic                                       | Type    | Description                                              |
+| ------------------------------------------- | ------- | -------------------------------------------------------- |
+| `mdbi_logger/avg_speed_inside_polytunnel`   | Float32 | Running average speed while inside a polytunnel.         |
+| `mdbi_logger/avg_speed_outside_polytunnel`  | Float32 | Running average speed while outside a polytunnel.        |
+| `mdbi_logger/time_in_current_mode`          | Float32 | Seconds since the last area transition (resets on change).|
+| `mdbi_logger/robot_status`                  | String  | Derived high-level status (see below).                   |
+| `mdbi_logger/navigation_area`               | String  | Current navigation area string.                          |
+
+#### Robot status derivation (priority order)
+
+| Priority | Status                  | Condition                                                     |
+| -------- | ----------------------- | ------------------------------------------------------------- |
+| 1        | **Held by picker**      | `/roboflow/execution_ui` is `"paused"`                       |
+| 2        | **Paused due to obstacle** | Autonomous mode, speed ≈ 0, area is known                  |
+| 3        | **Row-entry**           | Area = `TRANSITION_INTO_POLYTUNNEL`                           |
+| 4        | **In-row**              | Area = `INSIDE_POLYTUNNEL`                                    |
+| 5        | **Headland**            | Area = `OUTSIDE_POLYTUNNEL`                                   |
+| 6        | **Unknown**             | No area data received yet                                     |
+
+### Path deviation tracking (`PathDeviationTracker`)
+
+Subscribes (via `role: "global_path"`) to a `nav_msgs/msg/Path` topic (default `/plan`).
+
+On every odometry update the tracker computes the minimum perpendicular distance from the robot's current position to the closest segment of the received global path.
+
+| Topic                             | Type    | Description                                |
+| --------------------------------- | ------- | ------------------------------------------ |
+| `mdbi_logger/path_deviation_error`| Float32 | Cross-track error to the global path (m).  |
+
+### Periodic snapshot (`timer_event`)
+
+A timer (configurable via `snapshot_timer_interval`, default 5 s) fires periodically and logs a `timer_event` to MongoDB. This event captures:
+
+* Full `system_snapshot` (latest values from all subscribed topics)
+* Current metrics (distance, autonomous distance, speed, battery)
+* Navigation area tracker snapshot (area, status, per-area avg speeds, time-in-mode)
+* Path deviation tracker snapshot (error, path length)
+* Current `operation_mode` and `estop` state
+
+**`timer_event` does NOT increment `incidents` and does NOT affect MDBI.**
+
+---
+
+## 6. Mode Handling and Incidents
 
 * Default mode at startup is set to `Autonomous`:
 
@@ -461,7 +547,7 @@ Real robot (noisier signals):
 
 ---
 
-## 6. Launching the Node
+## 7. Launching the Node
 
 Example launch file (simplified; adapt package/executable names):
 
@@ -505,6 +591,7 @@ def generate_launch_description():
             'collision_time_window': LaunchConfiguration('collision_time_window'),
             'collision_log_cooldown': LaunchConfiguration('collision_log_cooldown'),
             'intervention_event_cooldown': LaunchConfiguration('intervention_event_cooldown'),
+            'snapshot_timer_interval': LaunchConfiguration('snapshot_timer_interval'),
         }],
     )
 
@@ -545,7 +632,7 @@ ros2 launch autonomy_metrics_logger autonomy_metrics_logger.launch.py \
 
 ---
 
-## 7. Testing Tips
+## 8. Testing Tips
 
 * Verify topics:
 
@@ -562,7 +649,49 @@ ros2 launch autonomy_metrics_logger autonomy_metrics_logger.launch.py \
     "{linear: {x: 0.5, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}"
   ```
 
+* Publish a navigation area:
+
+  ```bash
+  ros2 topic pub --once /robot_navigation_area std_msgs/msg/String "{data: 'INSIDE_POLYTUNNEL'}"
+  ```
+
+* Simulate picker hold:
+
+  ```bash
+  ros2 topic pub --once /roboflow/execution_ui std_msgs/msg/String "{data: 'paused'}"
+  ```
+
+* Verify derived topics:
+
+  ```bash
+  ros2 topic echo /mdbi_logger/robot_status
+  ros2 topic echo /mdbi_logger/avg_speed_inside_polytunnel
+  ros2 topic echo /mdbi_logger/path_deviation_error
+  ```
+
 * Check DB content (Mongo shell or Mongo client) in `robot_incidents.sessions`.
+  Look for events with `event_type: "timer_event"` for periodic snapshots.
+
+---
+
+## 9. Architecture Overview
+
+The node is structured with modular tracker classes to keep concerns separated:
+
+```
+AutonomyMetricsLogger (metric_logger.py)
+├── NavigationAreaTracker (navigation_area_tracker.py)
+│   ├── Area tracking (INSIDE / OUTSIDE / TRANSITION)
+│   ├── Per-area average speed
+│   ├── Time-in-current-mode
+│   └── Robot status derivation
+├── PathDeviationTracker (path_deviation_tracker.py)
+│   ├── Global path storage
+│   └── Cross-track error computation
+├── DatabaseMgr (db_mgr.py)
+│   └── MongoDB read/write
+└── Periodic snapshot timer (timer_event → MongoDB)
+```
 
 The README covers:
 

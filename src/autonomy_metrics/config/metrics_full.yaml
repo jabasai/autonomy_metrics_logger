@@ -130,3 +130,30 @@ topics:
   - name: "/gophar/motor_status/motor_1"
     type: "dynium_gophar_interfaces/msg/MotorStatus"
     log_all_fields: true
+
+  # ---------------------------------------------------------
+  # Navigation Area (INSIDE_POLYTUNNEL / OUTSIDE_POLYTUNNEL / TRANSITION_INTO_POLYTUNNEL)
+  # ---------------------------------------------------------
+  - name: "/robot_navigation_area"
+    type: "std_msgs/msg/String"
+    role: "navigation_area"
+    log_fields:
+      - "data"
+
+  # ---------------------------------------------------------
+  # Execution UI (idle / paused) – "paused" means held by picker
+  # ---------------------------------------------------------
+  - name: "/roboflow/execution_ui"
+    type: "std_msgs/msg/String"
+    role: "execution_ui"
+    log_fields:
+      - "data"
+
+  # ---------------------------------------------------------
+  # Global Path – used for path-deviation error computation
+  # Adjust the topic name to match your planner output.
+  # ---------------------------------------------------------
+  - name: "/plan"
+    type: "nav_msgs/msg/Path"
+    role: "global_path"
+    log_fields: []

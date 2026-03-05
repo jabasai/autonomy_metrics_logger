@@ -18,9 +18,11 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
 # Keep a few explicit imports used by default publishers (std msgs)
-from std_msgs.msg import Bool, Float32, Int32
+from std_msgs.msg import Bool, Float32, Int32, String
 
 from autonomy_metrics.db_mgr import DatabaseMgr as DBMgr
+from autonomy_metrics.navigation_area_tracker import NavigationAreaTracker
+from autonomy_metrics.path_deviation_tracker import PathDeviationTracker
 
 
 def ros_msg_to_dict(msg):
@@ -120,6 +122,7 @@ class AutonomyMetricsLogger(Node):
         self.declare_parameter('collision_time_window', 0.5)         # seconds: nav & collision cmds must be close in time
         self.declare_parameter('collision_log_cooldown', 1.0)        # seconds between logged collisions
         self.declare_parameter('intervention_event_cooldown', 1.0)   # default cooldown for YAML intervention triggers
+        self.declare_parameter('snapshot_timer_interval', 5.0)       # seconds between periodic snapshot events
 
         self.collision_nav_threshold = self.get_parameter('collision_nav_threshold').get_parameter_value().double_value
         self.collision_zero_threshold = self.get_parameter('collision_zero_threshold').get_parameter_value().double_value
@@ -128,6 +131,7 @@ class AutonomyMetricsLogger(Node):
         self.collision_time_window = self.get_parameter('collision_time_window').get_parameter_value().double_value
         self.collision_log_cooldown = self.get_parameter('collision_log_cooldown').get_parameter_value().double_value
         self.intervention_event_cooldown = self.get_parameter('intervention_event_cooldown').get_parameter_value().double_value
+        self.snapshot_timer_interval = self.get_parameter('snapshot_timer_interval').get_parameter_value().double_value
         self.mode_observer_cmd_timeout = self.get_parameter('mode_observer_cmd_timeout').get_parameter_value().double_value
         self.mode_observer_speed_threshold = self.get_parameter('mode_observer_speed_threshold').get_parameter_value().double_value
         self.config_path = self.get_parameter('config_yaml').get_parameter_value().string_value
@@ -221,6 +225,17 @@ class AutonomyMetricsLogger(Node):
         self.collision_incidents_publisher = self.create_publisher(Int32, 'mdbi_logger/total_collision_incidents', 10)
 
         self.heartbeat_timer = self.create_timer(1.0, self.timer_callback)
+
+        # --- Modular trackers ---
+        self.nav_area_tracker = NavigationAreaTracker(
+            self, paused_speed_threshold=self.mode_observer_speed_threshold
+        )
+        self.path_deviation_tracker = PathDeviationTracker(self)
+
+        # Periodic snapshot timer (records all data to MongoDB without affecting MDBI)
+        self.snapshot_timer = self.create_timer(
+            self.snapshot_timer_interval, self.periodic_snapshot_callback
+        )
 
         self.load_and_setup_config()
 
@@ -340,6 +355,12 @@ class AutonomyMetricsLogger(Node):
                     cb = lambda msg, n=name: self.collision_nav_callback(n, msg)
                 elif role == 'collision_output':
                     cb = lambda msg, n=name: self.collision_output_callback(n, msg)
+                elif role == 'navigation_area':
+                    cb = lambda msg, n=name: self.navigation_area_callback(n, msg)
+                elif role == 'execution_ui':
+                    cb = lambda msg, n=name: self.execution_ui_callback(n, msg)
+                elif role == 'global_path':
+                    cb = lambda msg, n=name: self.global_path_callback(n, msg)
                 else:
                     lf = item.get('log_fields', [])
                     cb = lambda msg, n=name, l=lf: self.generic_callback(n, msg, l)
@@ -537,6 +558,9 @@ class AutonomyMetricsLogger(Node):
         except Exception:
             return
 
+        # Always feed the current position to the path-deviation tracker
+        self.path_deviation_tracker.update_position(pos.x, pos.y)
+
         current_time = self.get_clock().now()
 
         if self.init_pose:
@@ -594,6 +618,14 @@ class AutonomyMetricsLogger(Node):
         self.publish_distance(self.distance)
         self.publish_speed(self.speed)
         self.handle_dynamic_publish(topic_name, msg)
+
+        # Feed speed to the navigation-area tracker
+        is_auto = self.details.get('operation_mode') == self.AUTO
+        self.nav_area_tracker.update_speed(self.speed, is_auto)
+
+        # Include tracker snapshots in the system snapshot
+        self.system_snapshot['navigation_area'] = self.nav_area_tracker.get_snapshot()
+        self.system_snapshot['path_deviation'] = self.path_deviation_tracker.get_snapshot()
 
     def control_mode_role_callback(self, topic_name, msg):
         cfg = self.topic_cfg_map.get(topic_name, {})
@@ -746,6 +778,48 @@ class AutonomyMetricsLogger(Node):
 
         except Exception as e:
             self.get_logger().error(f"Dynamic publish failed for {topic_name}: {e}")
+
+    # -------------------------
+    # Navigation Area / Execution UI / Global Path callbacks
+    # -------------------------
+    def navigation_area_callback(self, topic_name, msg):
+        """Handle /robot_navigation_area messages."""
+        area = msg.data.strip()
+        self.system_snapshot[topic_name] = {"data": area}
+        self.nav_area_tracker.update_area(area)
+
+    def execution_ui_callback(self, topic_name, msg):
+        """Handle /roboflow/execution_ui messages."""
+        state = msg.data.strip()
+        self.system_snapshot[topic_name] = {"data": state}
+        self.nav_area_tracker.update_execution_ui(state)
+
+    def global_path_callback(self, topic_name, msg):
+        """Handle global-path (nav_msgs/msg/Path) messages."""
+        self.path_deviation_tracker.update_path(msg)
+        self.system_snapshot[topic_name] = {
+            "num_poses": len(msg.poses),
+        }
+
+    # -------------------------
+    # Periodic Snapshot (timer_event)
+    # -------------------------
+    def periodic_snapshot_callback(self):
+        """
+        Periodically record all current data to MongoDB as a 'timer_event'.
+
+        This does NOT increment incidents and is excluded from MDBI calculations.
+        """
+        details = {
+            "system_snapshot": self.system_snapshot.copy(),
+            "metrics": self.get_metrics_snapshot(),
+            "navigation_area": self.nav_area_tracker.get_snapshot(),
+            "path_deviation": self.path_deviation_tracker.get_snapshot(),
+            "operation_mode": self.details.get("operation_mode"),
+            "estop": self.details.get("estop"),
+        }
+        self.log_event("timer_event", details)
+        self.get_logger().debug("[PeriodicSnapshot] timer_event logged to MongoDB")
 
     def update_observed_mode_from_odom(self, is_moving: bool, now=None):
         """
@@ -992,6 +1066,10 @@ class AutonomyMetricsLogger(Node):
             )
             self.speed = 0.0
             self.publish_speed(0.0)
+
+            # Update nav-area tracker with zero speed so status reflects stopped state
+            is_auto = self.details.get('operation_mode') == self.AUTO
+            self.nav_area_tracker.update_speed(0.0, is_auto)
 
     def update_db_metrics(self):
         # MBDI = autonomous_distance / incidents
