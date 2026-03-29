@@ -1,117 +1,161 @@
-from pymongo import MongoClient
-from datetime import datetime, timezone
-from bson import ObjectId
+from __future__ import annotations
 
-# NEW
+from datetime import datetime, timezone
+import math
+
+from bson import ObjectId
+from pymongo import DESCENDING, MongoClient
+
+
 try:
     import numpy as np
-except Exception:
+except Exception:  # pragma: no cover
     np = None
 
 
 class DatabaseMgr:
-    """
-    A class to manage database operations for robot session.
-    """
+    """MongoDB helper for session summaries, events, and periodic snapshots."""
 
-    def __init__(self, database_name='robot_incidents', host='localhost', port=27017):
+    def __init__(
+        self,
+        database_name: str = "robot_incidents",
+        host: str = "localhost",
+        port: int = 27017,
+    ):
         self.client = MongoClient(
-            f'mongodb://{host}:{port}/',
-            connectTimeoutMS=None
+            f"mongodb://{host}:{port}/",
+            connectTimeoutMS=1500,
+            serverSelectionTimeoutMS=1500,
         )
         self.db = self.client[database_name]
-        self.sessions_collection = self.db['sessions']
+        self.sessions_collection = self.db["sessions"]
+        self.events_collection = self.db["session_events"]
+        self.snapshots_collection = self.db["session_snapshots"]
         self.session_id = None
 
-    # NEW
+        self.sessions_collection.create_index([("session_start_time", DESCENDING)])
+        self.events_collection.create_index([("session_id", 1), ("time", DESCENDING)])
+        self.snapshots_collection.create_index([("session_id", 1), ("time", DESCENDING)])
+
     def _bson_safe(self, obj):
-        """Recursively convert non-BSON types (notably numpy) into Mongo-friendly types."""
         if np is not None:
-            # numpy arrays -> list
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
-            # numpy scalar -> python scalar
             if isinstance(obj, np.generic):
                 return obj.item()
 
+        if isinstance(obj, float):
+            if math.isfinite(obj):
+                return obj
+            return None
+
         if isinstance(obj, dict):
-            return {k: self._bson_safe(v) for k, v in obj.items()}
+            return {key: self._bson_safe(value) for key, value in obj.items()}
 
         if isinstance(obj, (list, tuple)):
-            return [self._bson_safe(v) for v in obj]
+            return [self._bson_safe(value) for value in obj]
 
         return obj
 
-    def init_session(self, env_variables, aoc_repos_info):
-        session_start = datetime.now(tz=timezone.utc)
-        session_document = {
-            "session_start_time": session_start,
-            "robot_name": env_variables['robot_name'],
-            "farm_name": env_variables['farm_name'],
-            "field_name": env_variables['field_name'],
-            "application": env_variables['application'],
-            "scenario_name": env_variables['scenario_name'],
-            "aoc_repos_info": aoc_repos_info,
-            "mdbi": None,
-            "incidents": 0,
-            "distance": 0,
-            "autonomous_distance": 0,
-            "collision_incidents": 0,
-            "events": []
-        }
+    def _json_safe(self, obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.astimezone(timezone.utc).isoformat()
+        if isinstance(obj, dict):
+            return {key: self._json_safe(value) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [self._json_safe(value) for value in obj]
+        return obj
 
-        # NEW: sanitize (in case aoc_repos_info contains numpy types)
-        session_document = self._bson_safe(session_document)
+    def init_session(self, env_variables: dict, git_repos_info: list[dict], metadata: dict):
+        session_start = datetime.now(tz=timezone.utc)
+        session_document = self._bson_safe(
+            {
+                "session_start_time": session_start,
+                "session_end_time": None,
+                "robot_name": env_variables.get("robot_name", "UNDEFINED"),
+                "farm_name": env_variables.get("farm_name", "UNDEFINED"),
+                "field_name": env_variables.get("field_name", "UNDEFINED"),
+                "application": env_variables.get("application", "UNDEFINED"),
+                "scenario_name": env_variables.get("scenario_name", "UNDEFINED"),
+                "aoc_repos_info": git_repos_info,
+                "summary": metadata,
+            }
+        )
 
         result = self.sessions_collection.insert_one(session_document)
         self.session_id = result.inserted_id
+        return str(self.session_id)
 
-    def add_event(self, event):
-        # NEW: sanitize event before writing
-        event = self._bson_safe(event)
-
+    def update_session_summary(self, summary: dict):
+        if self.session_id is None:
+            return False
+        summary = self._bson_safe(summary)
         result = self.sessions_collection.update_one(
-            {"_id": ObjectId(self.session_id)},
-            {"$addToSet": {"events": event}}
+            {"_id": self.session_id},
+            {"$set": {"summary": summary, "last_updated_time": datetime.now(tz=timezone.utc)}},
         )
-        return result.modified_count > 0
+        return result.acknowledged
 
-    def update_incidents(self, incidents):
-        incidents = self._bson_safe(incidents)  # harmless; keeps pattern consistent
+    def mark_session_end(self, summary: dict | None = None):
+        if self.session_id is None:
+            return False
+        update = {"session_end_time": datetime.now(tz=timezone.utc)}
+        if summary is not None:
+            update["summary"] = self._bson_safe(summary)
         result = self.sessions_collection.update_one(
-            {"_id": ObjectId(self.session_id)},
-            {"$set": {"incidents": incidents}}
+            {"_id": self.session_id},
+            {"$set": update},
         )
-        return result.modified_count > 0
+        return result.acknowledged
 
-    def update_distance(self, distance):
-        distance = self._bson_safe(distance)
-        result = self.sessions_collection.update_one(
-            {"_id": ObjectId(self.session_id)},
-            {"$set": {"distance": distance}}
+    def add_event(self, event: dict):
+        if self.session_id is None:
+            return False
+        document = self._bson_safe(
+            {
+                "session_id": self.session_id,
+                **event,
+            }
         )
-        return result.modified_count > 0
+        result = self.events_collection.insert_one(document)
+        return bool(result.inserted_id)
 
-    def update_autonomous_distance(self, autonomous_distance):
-        autonomous_distance = self._bson_safe(autonomous_distance)
-        result = self.sessions_collection.update_one(
-            {"_id": ObjectId(self.session_id)},
-            {"$set": {"autonomous_distance": autonomous_distance}}
+    def add_snapshot(self, snapshot: dict):
+        if self.session_id is None:
+            return False
+        document = self._bson_safe(
+            {
+                "session_id": self.session_id,
+                **snapshot,
+            }
         )
-        return result.modified_count > 0
+        result = self.snapshots_collection.insert_one(document)
+        return bool(result.inserted_id)
 
-    def update_mdbi(self, mdbi):
-        mdbi = self._bson_safe(mdbi)
-        result = self.sessions_collection.update_one(
-            {"_id": ObjectId(self.session_id)},
-            {"$set": {"mdbi": mdbi}}
+    def fetch_latest_session(self) -> dict | None:
+        document = self.sessions_collection.find_one(
+            sort=[("session_start_time", DESCENDING)]
         )
-        return result.modified_count > 0
+        return self._json_safe(document) if document else None
 
-    def update_collision_incidents(self, collision_incidents):
-        collision_incidents = self._bson_safe(collision_incidents)
-        result = self.sessions_collection.update_one(
-            {"_id": ObjectId(self.session_id)},
-            {"$set": {"collision_incidents": collision_incidents}}
+    def fetch_recent_events(self, limit: int = 20, session_id: str | None = None) -> list[dict]:
+        query = {}
+        if session_id:
+            query["session_id"] = ObjectId(session_id)
+        documents = list(
+            self.events_collection.find(query).sort("time", DESCENDING).limit(limit)
         )
-        return result.modified_count > 0
+        return self._json_safe(documents)
+
+    def fetch_recent_snapshots(
+        self, limit: int = 10, session_id: str | None = None
+    ) -> list[dict]:
+        query = {}
+        if session_id:
+            query["session_id"] = ObjectId(session_id)
+        documents = list(
+            self.snapshots_collection.find(query).sort("time", DESCENDING).limit(limit)
+        )
+        return self._json_safe(documents)

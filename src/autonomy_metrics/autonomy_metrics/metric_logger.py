@@ -1,1301 +1,757 @@
 #!/usr/bin/env python3
-"""
-YAML-driven AutonomyMetricsLogger
-Author: Ibrahim Hroob - JABASAI
-"""
+"""Config-driven ROS 2 autonomy metrics logger."""
 
-import os
-import math
-import subprocess
-import yaml
-import time
+from __future__ import annotations
+
+from collections import defaultdict
 from datetime import datetime, timezone
-from importlib import import_module
+import json
+import math
+import os
+from pathlib import Path
+
+import yaml
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from rclpy.time import Time
 
-# Keep a few explicit imports used by default publishers (std msgs)
+from ament_index_python.packages import get_package_share_directory
+from nav_msgs.msg import Odometry, Path as PathMsg
 from std_msgs.msg import Bool, Float32, Int32, String
 
-from autonomy_metrics.db_mgr import DatabaseMgr as DBMgr
-from autonomy_metrics.navigation_area_tracker import NavigationAreaTracker
-from autonomy_metrics.path_deviation_tracker import PathDeviationTracker
+from autonomy_metrics.db_mgr import DatabaseMgr
+from autonomy_metrics.git_utils import collect_git_repos_info
+from autonomy_metrics.topic_utils import import_msg_type, ros_msg_to_dict
 
 
-def ros_msg_to_dict(msg):
-    """
-    Recursively convert a ROS 2 Python message into a plain dict / list / primitive
-    so it can be safely stored in system_snapshot / Mongo.
-
-    Works for nested messages and sequences.
-    """
-    # Primitive types
-    if isinstance(msg, (bool, int, float, str)):
-        return msg
-
-    # Sequences (lists, tuples, etc.)
-    if isinstance(msg, (list, tuple)):
-        return [ros_msg_to_dict(v) for v in msg]
-
-    # ROS 2 messages usually have get_fields_and_field_types()
-    if hasattr(msg, "get_fields_and_field_types"):
-        data = {}
-        for field_name in msg.get_fields_and_field_types().keys():
-            try:
-                val = getattr(msg, field_name)
-                data[field_name] = ros_msg_to_dict(val)
-            except Exception:
-                # Best-effort; skip problematic fields
-                pass
-        return data
-
-    # Fallback: try to convert __dict__
-    if hasattr(msg, "__dict__"):
-        return {
-            k: ros_msg_to_dict(v)
-            for k, v in msg.__dict__.items()
-            if not k.startswith('_')
-        }
-
-    # Last resort: return as-is
-    return msg
-
-
-def import_msg_type(type_str: str):
-    """Dynamically imports message types based on string."""
-    try:
-        parts = type_str.split('/')
-        if len(parts) == 2:
-            pkg, cls_name = parts
-            submodule = 'msg'
-        elif len(parts) == 3:
-            pkg, submodule, cls_name = parts
-        else:
-            raise ValueError("Message type must be 'pkg/msg/MessageName' or 'pkg/MessageName'")
-
-        module = import_module(f"{pkg}.{submodule}")
-        return getattr(module, cls_name)
-    except Exception as e:
-        raise ImportError(f"Failed to import message type '{type_str}': {e}")
-
-
-def get_nested_field(obj, path: str):
-    try:
-        cur = obj
-        for part in path.split('.'):
-            if '[' in part and part.endswith(']'):
-                name, idx = part[:-1].split('[')
-                cur = getattr(cur, name)
-                cur = cur[int(idx)]
-            else:
-                cur = getattr(cur, part)
-        return cur
-    except Exception as e:
-        raise AttributeError(f"Failed to get '{path}': {e}")
+AUTONOMOUS_LABEL = "Autonomous"
+MANUAL_LABEL = "Manual"
+ROBOT_STATE_DISABLED = "Disabled"
+ROBOT_STATE_ACTIVE = "Active"
+KNOWN_AREAS = (
+    "INSIDE_POLYTUNNEL",
+    "OUTSIDE_POLYTUNNEL",
+    "TRANSITION_INTO_POLYTUNNEL",
+)
 
 
 class AutonomyMetricsLogger(Node):
+    """Main ROS 2 node for autonomy/session metrics and MongoDB logging."""
+
     def __init__(self):
-        super().__init__('mdbi_logger_dynamic')
+        super().__init__("autonomy_metrics_logger")
 
-        self.get_logger().info("Starting YAML-driven AutonomyMetricsLogger")
-
-        # Parameters
-        self.declare_parameter('config_yaml', '/home/ros/aoc_strawberry_scenario_ws/src/aoc_strawberry_scenario/jabas/autonomy_metrics_logger/src/autonomy_metrics/config/metrics_full.yaml')
-        self.declare_parameter('mongodb_host', 'localhost')
-        self.declare_parameter('mongodb_port', 27018)
-        self.declare_parameter('remote_mongodb_host', '')
-        self.declare_parameter('remote_mongodb_port', 27017)
-        self.declare_parameter('enable_remote_logging', False)
-        self.declare_parameter('min_distance_threshold', 0.2)
-        self.declare_parameter('stop_timeout', 2.0)
-        self.declare_parameter('mode_observer_cmd_timeout', 1.0)         # seconds
-        self.declare_parameter('mode_observer_speed_threshold', 0.01)    # m/s
-        # Collision detection tuning
-        self.declare_parameter('collision_nav_threshold', 0.01)      # nav cmd must be > this
-        self.declare_parameter('collision_zero_threshold', 0.001)    # collision cmd abs(linear.x) <= this
-        self.declare_parameter('collision_moving_threshold', 0.03)   # collision cmd abs(linear.x) >= this to consider as "has velocity"
-        self.declare_parameter('collision_zero_required_count', 2)    # require N consecutive near-zero collision commands before logging
-        self.declare_parameter('collision_time_window', 0.5)         # seconds: nav & collision cmds must be close in time
-        self.declare_parameter('collision_log_cooldown', 1.0)        # seconds between logged collisions
-        self.declare_parameter('intervention_event_cooldown', 1.0)   # default cooldown for YAML intervention triggers
-        self.declare_parameter('snapshot_timer_interval', 5.0)       # seconds between periodic snapshot events
-
-        self.collision_nav_threshold = self.get_parameter('collision_nav_threshold').get_parameter_value().double_value
-        self.collision_zero_threshold = self.get_parameter('collision_zero_threshold').get_parameter_value().double_value
-        self.collision_moving_threshold = self.get_parameter('collision_moving_threshold').get_parameter_value().double_value
-        self.collision_zero_required_count = self.get_parameter('collision_zero_required_count').get_parameter_value().integer_value
-        self.collision_time_window = self.get_parameter('collision_time_window').get_parameter_value().double_value
-        self.collision_log_cooldown = self.get_parameter('collision_log_cooldown').get_parameter_value().double_value
-        self.intervention_event_cooldown = self.get_parameter('intervention_event_cooldown').get_parameter_value().double_value
-        self.snapshot_timer_interval = self.get_parameter('snapshot_timer_interval').get_parameter_value().double_value
-        self.mode_observer_cmd_timeout = self.get_parameter('mode_observer_cmd_timeout').get_parameter_value().double_value
-        self.mode_observer_speed_threshold = self.get_parameter('mode_observer_speed_threshold').get_parameter_value().double_value
-        self.config_path = self.get_parameter('config_yaml').get_parameter_value().string_value
-        self.mongo_host = self.get_parameter('mongodb_host').get_parameter_value().string_value
-        self.mongo_port = self.get_parameter('mongodb_port').get_parameter_value().integer_value
-        self.remote_mongo_host = self.get_parameter('remote_mongodb_host').get_parameter_value().string_value
-        self.remote_mongo_port = self.get_parameter('remote_mongodb_port').get_parameter_value().integer_value
-        self.enable_remote_logging = self.get_parameter('enable_remote_logging').get_parameter_value().bool_value
-        self.min_distance_threshold = self.get_parameter('min_distance_threshold').get_parameter_value().double_value
-        self.stop_timeout = self.get_parameter('stop_timeout').get_parameter_value().double_value
-
-        self.get_logger().info(f"Config path: {self.config_path}")
-        self.get_logger().info(
-            f"Collision params: nav_thr={self.collision_nav_threshold}, "
-            f"zero_thr={self.collision_zero_threshold}, moving_thr={self.collision_moving_threshold}, "
-            f"zero_required={self.collision_zero_required_count}, time_window={self.collision_time_window}, "
-            f"cooldown={self.collision_log_cooldown}"
+        default_config_path = os.path.join(
+            get_package_share_directory("autonomy_metrics"),
+            "config",
+            "metrics_full.yaml",
         )
 
-        # DB Managers
-        self.db_mgr_local = DBMgr(host=self.mongo_host, port=self.mongo_port)
-        self.db_mgr_remote = None
-        if self.enable_remote_logging and self.remote_mongo_host:
-            try:
-                self.db_mgr_remote = DBMgr(host=self.remote_mongo_host, port=self.remote_mongo_port)
-                self.get_logger().info(
-                    f"Remote DB logging enabled: {self.remote_mongo_host}:{self.remote_mongo_port}"
-                )
-            except Exception as e:
-                self.get_logger().error(f"Failed to initialize remote DB manager: {e}")
+        self.declare_parameter("config_yaml", default_config_path)
+        self.declare_parameter("mongodb_host", "localhost")
+        self.declare_parameter("mongodb_port", 27018)
+        self.declare_parameter("remote_mongodb_host", "")
+        self.declare_parameter("remote_mongodb_port", 27017)
+        self.declare_parameter("enable_remote_logging", False)
+        self.declare_parameter("database_name", "robot_incidents")
 
-        # Internal metrics state
-        self.mdbi = 0.0
-        self.incidents = 0
-        self.distance = 0.0
-        self.autonomous_distance = 0.0
-        self.autonomous_time = 0.0
-        self.autonomous_start_time = None
-        self.AUTO = 'Autonomous'
-        self.MAN = 'Manual'
-        self.details = {'estop': False, 'operation_mode': self.AUTO}
+        self.config_path = self.get_parameter("config_yaml").value
+        self.database_name = self.get_parameter("database_name").value
+        self.mongo_host = self.get_parameter("mongodb_host").value
+        self.mongo_port = self.get_parameter("mongodb_port").value
+        self.remote_mongo_host = self.get_parameter("remote_mongodb_host").value
+        self.remote_mongo_port = self.get_parameter("remote_mongodb_port").value
+        self.enable_remote_logging = self.get_parameter("enable_remote_logging").value
 
-        # Mode observation (velocity-based fallback when no "operation_mode" topic available)
-        self.has_explicit_control_mode = False
-        self.mode_observer_enabled = False
-        self.mode_observer_active = False
-        self.mode_observer_topic_name = None
-        self.last_auto_cmd_time = None
-
-        # Collision monitoring
-        self.collision_incidents = 0
-        self.collision_prev_has_velocity = False  # for falling-edge detection
-        self.collision_zero_streak = 0
-
-        self.last_nav_cmd = None
-        self.last_nav_time = None
-        self.last_collision_cmd = None
-        self.last_collision_time = None
-        self.last_collision_logged_time = None
-
-        # ----------------------------------------------------
-        # Global Snapshot Storage
-        # Stores the latest extracted values from all topics
-        # ----------------------------------------------------
-        self.system_snapshot = {}
-
-        # Snapshot of latest values per field for change detection
-        self.prev_field_values = {}
-        self.prev_message_trigger_active = {}
-        self.last_intervention_event_time = {}
-
-        # Current battery level (updated from any topic with 'battery_field')
-        self.current_battery = None
-
-        # Odometry / Speed state
-        self.previous_x = None
-        self.previous_y = None
-        self.init_pose = True
-        self.speed = 0.0
-        self.last_odom_update_time = self.get_clock().now()
-
-        self.dynamic_subs = []
-        self.dynamic_publishers = {}
+        self.config = self._load_config(self.config_path)
+        self.runtime_cfg = self.config.get("runtime", {})
+        self.required_roles = defaultdict(list)
         self.topic_cfg_map = {}
 
-        # Static Publishers (Standard Metrics)
-        self.heartbeat_publisher = self.create_publisher(Bool, 'mdbi_logger/heartbeat', 10)
-        self.distance_publisher = self.create_publisher(Float32, 'mdbi_logger/total_traveled_distance', 10)
-        self.incidents_publisher = self.create_publisher(Int32, 'mdbi_logger/total_incidents', 10)
-        self.speed_publisher = self.create_publisher(Float32, 'mdbi_logger/robot_speed', 10)
-        self.collision_incidents_publisher = self.create_publisher(Int32, 'mdbi_logger/total_collision_incidents', 10)
-
-        self.heartbeat_timer = self.create_timer(1.0, self.timer_callback)
-
-        # --- Modular trackers ---
-        self.nav_area_tracker = NavigationAreaTracker(
-            self, paused_speed_threshold=self.mode_observer_speed_threshold
+        self.heartbeat_period_sec = float(
+            self.runtime_cfg.get("heartbeat_period_sec", 1.0)
         )
-        self.path_deviation_tracker = PathDeviationTracker(self)
+        self.snapshot_interval_sec = float(
+            self.runtime_cfg.get("snapshot_interval_sec", 10.0)
+        )
+        self.distance_epsilon_m = float(self.runtime_cfg.get("distance_epsilon_m", 0.01))
+        self.stale_speed_timeout_sec = float(
+            self.runtime_cfg.get("stale_speed_timeout_sec", 2.0)
+        )
+        self.session_summary_topic = str(
+            self.runtime_cfg.get(
+                "session_summary_topic", "/autonomy_metrics/session_summary_json"
+            )
+        )
+        self.heartbeat_topic = str(
+            self.runtime_cfg.get("heartbeat_topic", "/autonomy_metrics/heartbeat")
+        )
 
-        # Periodic snapshot timer (records all data to MongoDB without affecting MDBI)
+        self.autonomous_mode = False
+        self.mode_entered_at = self._now_sec()
+        self.mode_totals_sec = {
+            AUTONOMOUS_LABEL: 0.0,
+            MANUAL_LABEL: 0.0,
+        }
+        self.intervention_count = 0
+        self.intervention_heartbeat_states = {}
+        self.last_intervention_details = None
+
+        self.robot_state = ROBOT_STATE_DISABLED
+        self.active_to_disabled_in_autonomous_count = 0
+
+        self.total_distance_m = 0.0
+        self.distance_by_mode_m = {
+            AUTONOMOUS_LABEL: 0.0,
+            MANUAL_LABEL: 0.0,
+        }
+        self.last_motion_position = None
+        self.first_motion_time_sec = None
+        self.last_motion_time_sec = None
+        self.last_speed_update_sec = None
+        self.current_speed_mps = 0.0
+
+        self.current_area = None
+        self.area_entered_at = None
+        self.area_totals_sec = defaultdict(float)
+        self.area_visit_count = defaultdict(int)
+        self.area_distance_m = defaultdict(float)
+
+        self.current_path = []
+        self.current_path_deviation_m = None
+        self.max_path_deviation_m = 0.0
+        self.path_deviation_sum_m = 0.0
+        self.path_deviation_samples = 0
+
+        self.latest_topic_values = {}
+        self.snapshot_topics = set()
+        self.topic_subscriptions = []
+
+        self._setup_publishers()
+        self._setup_databases()
+        self._setup_subscriptions()
+        self._init_session()
+
+        self.heartbeat_timer = self.create_timer(
+            self.heartbeat_period_sec, self._heartbeat_timer_callback
+        )
         self.snapshot_timer = self.create_timer(
-            self.snapshot_timer_interval, self.periodic_snapshot_callback
+            self.snapshot_interval_sec, self._snapshot_timer_callback
         )
 
-        self.load_and_setup_config()
+        self.get_logger().info(
+            f"Autonomy metrics logger ready using config {self.config_path}"
+        )
 
-        # Use the observer only if there is no explicit control_mode topic configured
-        self.mode_observer_active = self.mode_observer_enabled and not self.has_explicit_control_mode
-        if self.mode_observer_active:
-            self.get_logger().info(
-                f"Mode observer enabled using topic {self.mode_observer_topic_name} "
-                "(no explicit control_mode topic configured)"
+    def _load_config(self, config_path: str) -> dict:
+        config_file = Path(config_path)
+        if not config_file.is_file():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        with config_file.open("r", encoding="utf-8") as handle:
+            return yaml.safe_load(handle) or {}
+
+    def _setup_publishers(self):
+        self.heartbeat_publisher = self.create_publisher(Bool, self.heartbeat_topic, 10)
+        self.mode_publisher = self.create_publisher(
+            String, "/autonomy_metrics/current_mode", 10
+        )
+        self.interventions_publisher = self.create_publisher(
+            Int32, "/autonomy_metrics/interventions", 10
+        )
+        self.mdbi_publisher = self.create_publisher(Float32, "/autonomy_metrics/mdbi", 10)
+        self.robot_state_transition_publisher = self.create_publisher(
+            Int32, "/autonomy_metrics/active_to_disabled_in_autonomous", 10
+        )
+        self.total_distance_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/total_distance_m", 10
+        )
+        self.autonomous_distance_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/autonomous_distance_m", 10
+        )
+        self.manual_distance_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/manual_distance_m", 10
+        )
+        self.current_speed_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/current_speed_mps", 10
+        )
+        self.average_speed_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/average_speed_mps", 10
+        )
+        self.autonomous_time_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/autonomous_time_sec", 10
+        )
+        self.manual_time_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/manual_time_sec", 10
+        )
+        self.navigation_area_publisher = self.create_publisher(
+            String, "/autonomy_metrics/current_navigation_area", 10
+        )
+        self.path_deviation_current_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/path_deviation/current_m", 10
+        )
+        self.path_deviation_average_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/path_deviation/average_m", 10
+        )
+        self.path_deviation_max_publisher = self.create_publisher(
+            Float32, "/autonomy_metrics/path_deviation/max_m", 10
+        )
+        self.summary_publisher = self.create_publisher(
+            String, self.session_summary_topic, 10
+        )
+
+    def _setup_databases(self):
+        self.db_managers = []
+
+        local_db = DatabaseMgr(
+            database_name=self.database_name,
+            host=self.mongo_host,
+            port=self.mongo_port,
+        )
+        self.db_managers.append(local_db)
+
+        if self.enable_remote_logging and self.remote_mongo_host:
+            remote_db = DatabaseMgr(
+                database_name=self.database_name,
+                host=self.remote_mongo_host,
+                port=self.remote_mongo_port,
+            )
+            self.db_managers.append(remote_db)
+
+    def _setup_subscriptions(self):
+        topics = self.config.get("topics", [])
+        if not topics:
+            raise RuntimeError("No topics configured in metrics YAML")
+
+        for topic_cfg in topics:
+            topic_name = topic_cfg["name"]
+            topic_type = topic_cfg["type"]
+            role = topic_cfg.get("role", "").strip()
+            self.topic_cfg_map[topic_name] = topic_cfg
+
+            if topic_cfg.get("snapshot", False):
+                self.snapshot_topics.add(topic_name)
+
+            msg_type = import_msg_type(topic_type)
+            callback = self._build_topic_callback(topic_cfg)
+            subscription = self.create_subscription(
+                msg_type,
+                topic_name,
+                callback,
+                qos_profile_sensor_data,
+            )
+            self.topic_subscriptions.append(subscription)
+            if role:
+                self.required_roles[role].append(topic_name)
+            self.get_logger().info(f"Subscribed to {topic_name} with role '{role}'")
+
+        self._validate_required_roles()
+
+    def _validate_required_roles(self):
+        required = [
+            "autonomous_mode",
+            "intervention_heartbeat",
+            "robot_state",
+            "distance_odometry",
+            "navigation_area",
+            "global_path",
+            "global_pose_odometry",
+        ]
+        missing = [role for role in required if not self.required_roles.get(role)]
+        if missing:
+            raise RuntimeError(
+                "Config is missing required topic roles: " + ", ".join(sorted(missing))
             )
 
-        # Init Session
+        if len(self.required_roles.get("autonomous_mode", [])) != 1:
+            raise RuntimeError("Exactly one topic must use role 'autonomous_mode'")
+        if len(self.required_roles.get("robot_state", [])) != 1:
+            raise RuntimeError("Exactly one topic must use role 'robot_state'")
+        if len(self.required_roles.get("distance_odometry", [])) != 1:
+            raise RuntimeError("Exactly one topic must use role 'distance_odometry'")
+        if len(self.required_roles.get("global_path", [])) != 1:
+            raise RuntimeError("Exactly one topic must use role 'global_path'")
+        if len(self.required_roles.get("global_pose_odometry", [])) != 1:
+            raise RuntimeError("Exactly one topic must use role 'global_pose_odometry'")
+
+    def _init_session(self):
         env_variables = {
-            'robot_name': os.getenv('ROBOT_NAME', 'UNDEFINED'),
-            'farm_name': os.getenv('FARM_NAME', 'UNDEFINED'),
-            'field_name': os.getenv('FIELD_NAME', 'UNDEFINED'),
-            'application': os.getenv('APPLICATION', 'UNDEFINED'),
-            'scenario_name': os.getenv('SCENARIO_NAME', 'UNDEFINED'),
+            "robot_name": os.getenv("ROBOT_NAME", "UNDEFINED"),
+            "farm_name": os.getenv("FARM_NAME", "UNDEFINED"),
+            "field_name": os.getenv("FIELD_NAME", "UNDEFINED"),
+            "application": os.getenv("APPLICATION", "UNDEFINED"),
+            "scenario_name": os.getenv("SCENARIO_NAME", "UNDEFINED"),
         }
-
-        self.get_logger().info(
-            f"Session env: robot={env_variables['robot_name']}, "
-            f"farm={env_variables['farm_name']}, field={env_variables['field_name']}, "
-            f"app={env_variables['application']}, scenario={env_variables['scenario_name']}"
-        )
-
-        git_repos = []
-        if self.config:
+        git_repos = collect_git_repos_info(self.config)
+        initial_summary = self._build_summary()
+        active_db_managers = []
+        for db_manager in self.db_managers:
             try:
-                git_cfg = self.config.get('git_repos', {})
-                for label, p in git_cfg.items():
-                    repo_path = os.path.join('/home/ros/aoc_strawberry_scenario_ws/src/aoc_strawberry_scenario', p)
-                    repo_info = self.get_git_info(repo_path)
-                    git_repos.append({label: repo_info})
-                    self.get_logger().debug(
-                        f"Git repo [{label}]: path={repo_info['path']}, "
-                        f"branch={repo_info['branch']}, short_commit={repo_info['short_commit']}"
-                    )
-            except Exception as e:
-                self.get_logger().warn(f"Failed to collect git info: {e}")
-
-        self.db_mgr_local.init_session(env_variables, git_repos)
-        if self.db_mgr_remote:
-            self.db_mgr_remote.init_session(env_variables, git_repos)
-
-    def load_and_setup_config(self):
-        if not self.config_path:
-            self.config = {}
-            self.get_logger().warn("No config_yaml path provided; running with empty config.")
-            return
-
-        try:
-            with open(self.config_path, 'r') as f:
-                self.config = yaml.safe_load(f) or {}
-            self.get_logger().info(
-                f"Loaded metrics config from YAML. topics={len(self.config.get('topics', []))}"
-            )
-        except Exception as e:
-            self.get_logger().error(f"Failed to load YAML: {e}")
-            self.config = {}
-            return
-
-        topics = self.config.get('topics', [])
-
-        # Detect if an explicit control mode topic is configured
-        self.has_explicit_control_mode = any(
-            (t.get('role', '').lower() == 'control_mode') for t in topics
-        )
-        self.get_logger().info(f"Explicit control_mode topic present: {self.has_explicit_control_mode}")
-
-        for item in topics:
-            name = item.get('name')
-            type_str = item.get('type')
-
-            if not name or not type_str:
-                self.get_logger().warn(f"Skipping invalid topic config: {item}")
-                continue
-
-            self.topic_cfg_map[name] = item
-
-            role = item.get('role', '').lower()
-
-            if role == 'mode_observer':
-                self.mode_observer_enabled = True
-                self.mode_observer_topic_name = name
-                self.get_logger().info(f"Mode observer configured on topic: {name}")
-
-            # Dynamic Publisher Setup
-            pub_cfg = item.get('publish', {})
-            if pub_cfg.get('enable', False):
-                try:
-                    pub_msg_cls = import_msg_type(pub_cfg['type'])
-                    pub = self.create_publisher(pub_msg_cls, pub_cfg['topic'], 10)
-                    self.dynamic_publishers[name] = (pub, pub_msg_cls, pub_cfg.get('field'))
-                    self.get_logger().info(
-                        f"Dynamic publisher created: {pub_cfg['topic']} "
-                        f"(type={pub_cfg['type']}) from topic={name}"
-                    )
-                except Exception as e:
-                    self.get_logger().error(f"Pub creation failed for {name}: {e}")
-                    self.dynamic_publishers[name] = None
-            else:
-                self.dynamic_publishers[name] = None
-
-            # Subscription Setup
-            try:
-                msg_cls = import_msg_type(type_str)
-                role = item.get('role', '').lower()
-
-                if role == 'odometry':
-                    cb = lambda msg, n=name: self.odom_role_callback(n, msg)
-                elif role == 'control_mode':
-                    cb = lambda msg, n=name: self.control_mode_role_callback(n, msg)
-                elif role == 'estop':
-                    cb = lambda msg, n=name: self.estop_role_callback(n, msg)
-                elif role == 'collision_nav':
-                    cb = lambda msg, n=name: self.collision_nav_callback(n, msg)
-                elif role == 'collision_output':
-                    cb = lambda msg, n=name: self.collision_output_callback(n, msg)
-                elif role == 'navigation_area':
-                    cb = lambda msg, n=name: self.navigation_area_callback(n, msg)
-                elif role == 'execution_ui':
-                    cb = lambda msg, n=name: self.execution_ui_callback(n, msg)
-                elif role == 'global_path':
-                    cb = lambda msg, n=name: self.global_path_callback(n, msg)
-                else:
-                    lf = item.get('log_fields', [])
-                    cb = lambda msg, n=name, l=lf: self.generic_callback(n, msg, l)
-
-                self.create_subscription(msg_cls, name, cb, qos_profile_sensor_data)
-                self.get_logger().info(f"Subscribed to {name} (role={role})")
-
-            except Exception as e:
-                self.get_logger().error(f"Sub creation failed for {name}: {e}")
-
-    def get_metrics_snapshot(self):
-        """
-        Returns a lightweight metrics summary to attach to every event.
-        """
-        metrics = {
-            "distance": self.distance,
-            "autonomous_distance": self.autonomous_distance,
-            "speed": self.speed,
-        }
-        if self.current_battery is not None:
-            metrics["battery_percentage"] = self.current_battery
-        return metrics
-
-    def trigger_intervention(
-        self,
-        event_type: str,
-        extra: dict | None = None,
-        force_count: bool = False,
-        log_when_not_counted: bool = False,
-    ):
-        """
-        Log an intervention-type event.
-
-        - Only increments self.incidents when the robot is in Autonomous mode
-          (self.details['operation_mode'] == self.AUTO), unless force_count=True.
-        - Always logs the event (even in Manual) so history is preserved.
-        """
-        if extra is None:
-            extra = {}
-
-        current_mode = self.details.get('operation_mode', self.MAN)
-        count_incident = force_count or (current_mode == self.AUTO)
-
-        if count_incident:
-            self.incidents += 1
-        elif not log_when_not_counted:
-            self.get_logger().debug(
-                f"[Intervention] Suppressed event '{event_type}' in mode={current_mode} "
-                "(not counted and log_when_not_counted=False)."
-            )
-            return
-
-        self.get_logger().info(
-            f"[Intervention] type={event_type}, mode={current_mode}, "
-            f"counted={count_incident}, total_incidents={self.incidents}"
-        )
-
-        base_details = dict(self.details)  # estop, operation_mode, etc.
-        base_details.update(extra)
-        base_details["system_snapshot"] = self.system_snapshot.copy()
-
-        self.log_event(event_type, base_details)
-
-    def handle_intervention_triggers(self, topic_name: str, msg, data: dict, cfg: dict):
-        """
-        Apply YAML-configured triggers for this topic.
-        - intervention_on_message: triggers on any message
-        - intervention_on_change[field]: triggers when selected field changes
-        """
-        now = self.get_clock().now()
-
-        # 1) Trigger on message activity (e.g. /cmd_vel/joy)
-        msg_trig = cfg.get("intervention_on_message", {})
-        if msg_trig.get("enable", False):
-            evt_type = msg_trig.get("event_type", f"{topic_name}_activity")
-            require_auto = msg_trig.get("require_autonomous_mode", True)
-            on_rising_edge = msg_trig.get("on_rising_edge", True)
-            cooldown_sec = float(msg_trig.get("cooldown_sec", self.intervention_event_cooldown))
-
-            activity_field = msg_trig.get("activity_field", "linear.x")
-            min_abs_cfg = msg_trig.get("min_abs_value", None)
-            if min_abs_cfg is None:
-                if activity_field.startswith("linear.") or activity_field.startswith("angular."):
-                    min_abs_value = float(self.mode_observer_speed_threshold)
-                else:
-                    min_abs_value = 0.0
-            else:
-                min_abs_value = float(min_abs_cfg)
-
-            activity_value = None
-            try:
-                activity_value = get_nested_field(msg, activity_field)
-            except Exception:
-                if "data" in data:
-                    activity_value = data["data"]
-
-            if isinstance(activity_value, bool):
-                is_active = activity_value
-            elif isinstance(activity_value, (int, float)):
-                is_active = abs(float(activity_value)) >= min_abs_value
-            elif activity_value is None:
-                # If we cannot evaluate activity, treat any message as activity.
-                is_active = True
-            else:
-                is_active = bool(activity_value)
-
-            trig_key = (topic_name, evt_type)
-            prev_active = self.prev_message_trigger_active.get(trig_key, False)
-            self.prev_message_trigger_active[trig_key] = is_active
-
-            current_mode = self.details.get('operation_mode', self.MAN)
-            if require_auto and current_mode != self.AUTO:
-                self.get_logger().debug(
-                    f"[Trigger] Skip '{evt_type}' on '{topic_name}' because mode={current_mode}"
+                db_manager.init_session(
+                    env_variables=env_variables,
+                    git_repos_info=git_repos,
+                    metadata=initial_summary,
                 )
-            else:
-                should_fire = is_active and (not on_rising_edge or not prev_active)
-                if should_fire:
-                    last_event_time = self.last_intervention_event_time.get(trig_key)
-                    if last_event_time is not None:
-                        dt = (now - last_event_time).nanoseconds * 1e-9
-                        if dt < cooldown_sec:
-                            should_fire = False
-                            self.get_logger().debug(
-                                f"[Trigger] Cooldown active for '{evt_type}' ({dt:.3f}s < {cooldown_sec:.3f}s)"
-                            )
+                active_db_managers.append(db_manager)
+            except Exception as exc:
+                self.get_logger().warn(f"Failed to initialize MongoDB session: {exc}")
+        self.db_managers = active_db_managers
+        if not self.db_managers:
+            self.get_logger().warn("No MongoDB targets are currently writable.")
 
-                if should_fire:
-                    self.last_intervention_event_time[trig_key] = now
-                    self.get_logger().info(
-                        f"[Trigger] message_activity on '{topic_name}' -> event '{evt_type}', "
-                        f"value={activity_value}, active={is_active}"
-                    )
-                    self.trigger_intervention(
-                        evt_type,
-                        extra={
-                            "topic": topic_name,
-                            "activity_field": activity_field,
-                            "activity_value": activity_value,
-                        },
-                    )
+    def _build_topic_callback(self, topic_cfg: dict):
+        topic_name = topic_cfg["name"]
+        role = topic_cfg.get("role", "").strip()
 
-        # 2) Trigger on change of specific fields
-        field_trigs = cfg.get("intervention_on_change", {})
-        for field_name, trig_cfg in field_trigs.items():
-            if field_name not in data:
-                continue
+        def callback(msg):
+            self._store_latest_topic_value(topic_name, role, msg)
+            if role == "autonomous_mode":
+                self._handle_autonomous_mode(msg)
+            elif role == "intervention_heartbeat":
+                self._handle_intervention_heartbeat(topic_cfg, msg)
+            elif role == "robot_state":
+                self._handle_robot_state(msg)
+            elif role == "distance_odometry":
+                self._handle_distance_odometry(msg)
+            elif role == "navigation_area":
+                self._handle_navigation_area(msg)
+            elif role == "global_path":
+                self._handle_global_path(msg)
+            elif role == "global_pose_odometry":
+                self._handle_global_pose(msg)
 
-            key = (topic_name, field_name)
-            prev = self.prev_field_values.get(key)
-            new = data[field_name]
-            self.prev_field_values[key] = new
+        return callback
 
-            # First sample establishes baseline; don't emit a change event on startup.
-            if prev is None:
-                continue
-
-            changed = (prev != new)
-
-            if not changed:
-                continue
-
-            # Optional: only trigger on a specific value (e.g. True)
-            trigger_value = trig_cfg.get("trigger_value", None)
-            if trigger_value is not None and new != trigger_value:
-                continue
-
-            evt_type = trig_cfg.get(
-                "event_type", f"{topic_name}:{field_name}_changed"
-            )
-            extra = {
-                "topic": topic_name,
-                "field": field_name,
-                "new_value": new,
-                "prev_value": prev,
-            }
-            self.get_logger().info(
-                f"[Trigger] field_change on '{topic_name}.{field_name}' "
-                f"from {prev} -> {new} -> event '{evt_type}'"
-            )
-            self.trigger_intervention(evt_type, extra=extra)
-
-    # -------------------------
-    # Callbacks
-    # -------------------------
-    def odom_role_callback(self, topic_name, msg):
-        try:
-            pos = msg.pose.pose.position
-            # Update Snapshot with raw odom info
-            self.system_snapshot['odometry'] = {
-                'x': pos.x,
-                'y': pos.y,
-                'vx': msg.twist.twist.linear.x
-            }
-        except Exception:
-            return
-
-        # Always feed the current position to the path-deviation tracker
-        self.path_deviation_tracker.update_position(pos.x, pos.y)
-
-        current_time = self.get_clock().now()
-
-        if self.init_pose:
-            self.init_pose = False
-            self.previous_x = pos.x
-            self.previous_y = pos.y
-            self.previous_time = current_time
-            self.last_odom_update_time = current_time
-            self.get_logger().info(
-                f"[Odom] Initial pose set x={pos.x:.3f}, y={pos.y:.3f}"
-            )
-            return
-
-        dx = pos.x - self.previous_x
-        dy = pos.y - self.previous_y
-        dist = math.sqrt(dx * dx + dy * dy)
-
-        if dist < self.min_distance_threshold:
-            # Too small to count as movement
-            return
-
-        if not hasattr(self, 'previous_time'):
-            self.previous_time = current_time
-
-        time_diff = (current_time - self.previous_time).nanoseconds * 1e-9
-
-        self.speed = dist / time_diff if time_diff > 0 else 0.0
-        self.distance += dist
-
-        # Use observed mode if enabled (fallback when no explicit control_mode topic)
-        is_moving = self.speed > self.mode_observer_speed_threshold
-        self.update_observed_mode_from_odom(is_moving=is_moving, now=current_time)
-
-        if self.details.get('operation_mode') == self.AUTO:
-            self.autonomous_distance += dist
-
-        self.previous_x = pos.x
-        self.previous_y = pos.y
-        self.previous_time = current_time
-        self.last_odom_update_time = current_time
-
-        # Keep metrics in the snapshot too
-        self.system_snapshot['metrics'] = {
-            'distance': self.distance,
-            'autonomous_distance': self.autonomous_distance,
-            'speed': self.speed,
+    def _store_latest_topic_value(self, topic_name: str, role: str, msg):
+        topic_cfg = self.topic_cfg_map[topic_name]
+        data = self._serialize_topic_value(topic_cfg, msg)
+        self.latest_topic_values[topic_name] = {
+            "role": role,
+            "received_at": self._now_datetime().isoformat(),
+            "data": data,
         }
 
-        self.get_logger().debug(
-            f"[Odom] step_dist={dist:.3f} m, total_dist={self.distance:.3f} m, "
-            f"auto_dist={self.autonomous_distance:.3f} m, speed={self.speed:.3f} m/s, "
-            f"mode={self.details.get('operation_mode')}"
-        )
-
-        self.publish_distance(self.distance)
-        self.publish_speed(self.speed)
-        self.handle_dynamic_publish(topic_name, msg)
-
-        # Feed speed to the navigation-area tracker
-        is_auto = self.details.get('operation_mode') == self.AUTO
-        self.nav_area_tracker.update_speed(self.speed, is_auto)
-
-        # Include tracker snapshots in the system snapshot
-        self.system_snapshot['navigation_area'] = self.nav_area_tracker.get_snapshot()
-        self.system_snapshot['path_deviation'] = self.path_deviation_tracker.get_snapshot()
-
-    def control_mode_role_callback(self, topic_name, msg):
-        cfg = self.topic_cfg_map.get(topic_name, {})
-        mode_field = cfg.get('mode_field', 'data')
-        try:
-            val = get_nested_field(msg, mode_field)
-        except Exception:
-            return
-
-        mapping = cfg.get('mode_mapping', {})
-        new_mode = mapping.get(str(val)) or mapping.get(val)
-
-        if new_mode is None:
-            if str(val) == "3":
-                new_mode = self.MAN
-            else:
-                new_mode = self.AUTO
-
-        current_time = datetime.now()
-
-        if new_mode != self.details.get('operation_mode'):
-            prev_mode = self.details.get('operation_mode')
-            self.details['operation_mode'] = new_mode
-            self.get_logger().info(
-                f"Mode changed (explicit): {prev_mode} -> {new_mode} (raw={val})"
-            )
-
-            if prev_mode == self.AUTO and new_mode == self.MAN:
-                if self.autonomous_start_time:
-                    delta = (current_time - self.autonomous_start_time).total_seconds()
-                    self.autonomous_time += delta
-                    self.autonomous_start_time = None
-
-                # Manual override is an intervention
-                self.trigger_intervention('Manual_override', force_count=True)
-
-            elif new_mode == self.AUTO:
-                self.autonomous_start_time = current_time
-                # Logging autonomous mode change (not counted as intervention)
-                self.log_event('Autonomous', {
-                    **self.details,
-                    'system_snapshot': self.system_snapshot.copy()
-                })
-
-    def estop_role_callback(self, topic_name, msg):
-        cfg = self.topic_cfg_map.get(topic_name, {})
-        field = cfg.get('field', 'data')
-        try:
-            v = bool(get_nested_field(msg, field))
-            # Update Snapshot
-            self.system_snapshot['estop'] = v
-        except Exception:
-            return
-
-        if v != self.details.get('estop', False):
-            self.details['estop'] = v
-            self.get_logger().info(f"E-Stop state changed: {v}")
-            if v:
-                # E-stop counts as intervention
-                self.trigger_intervention('EMS', log_when_not_counted=True)
-
-    def generic_callback(self, topic_name, msg, log_fields):
-        cfg = self.topic_cfg_map.get(topic_name, {})
-        role = cfg.get('role', '').lower()
-
-        # Mode observer special-case
-        if role == 'mode_observer':
-            self.last_auto_cmd_time = self.get_clock().now()
-            self.system_snapshot['mode_observer'] = {
-                'topic': topic_name
-            }
-            self.get_logger().debug(
-                f"[ModeObserver] Received command on {topic_name}, "
-                f"marking recent autonomous command."
-            )
-
-        data = {}
-        log_all = bool(cfg.get("log_all_fields", False))
-
-        if log_all:
-            try:
-                data = ros_msg_to_dict(msg)
-            except Exception as e:
-                self.get_logger().warn(
-                    f"Failed to serialize all fields for {topic_name}: {e}"
-                )
-                data = {}
-        else:
-            for f in log_fields:
-                try:
-                    data[f] = get_nested_field(msg, f)
-                except Exception:
-                    pass
-
-        if data:
-            # Update Snapshot with the latest values from this topic
-            self.system_snapshot[topic_name] = data
-
-            # If this topic carries battery info, update the battery state
-            battery_field = cfg.get("battery_field")
-            if battery_field and battery_field in data:
-                old_batt = self.current_battery
-                self.current_battery = data[battery_field]
-                if old_batt is None or abs(self.current_battery - old_batt) >= 1.0:
-                    self.get_logger().info(
-                        f"[Battery] {topic_name}.{battery_field} updated: "
-                        f"{old_batt} -> {self.current_battery}"
-                    )
-
-        # Apply YAML-configured intervention triggers (message & field-change)
-        self.handle_intervention_triggers(topic_name, msg, data, cfg)
-
-        # Dynamic republishing if configured
-        self.handle_dynamic_publish(topic_name, msg)
-
-    def handle_dynamic_publish(self, topic_name, msg):
-        pub_cfg = self.dynamic_publishers.get(topic_name)
-        if not pub_cfg:
-            return
-        publisher, pub_msg_cls, pub_field = pub_cfg
-
-        try:
-            val = get_nested_field(msg, pub_field) if pub_field else msg
-
-            out_msg = pub_msg_cls()
-            if hasattr(out_msg, 'data'):
-                if 'Float' in pub_msg_cls.__name__:
-                    out_msg.data = float(val)
-                elif 'Int' in pub_msg_cls.__name__:
-                    out_msg.data = int(val)
-                elif 'String' in pub_msg_cls.__name__:
-                    out_msg.data = str(val)
-                else:
-                    out_msg.data = val
-            else:
-                # Try simple attribute matching
-                for attr in dir(out_msg):
-                    if not attr.startswith('_'):
-                        try:
-                            setattr(out_msg, attr, val)
-                            break
-                        except Exception:
-                            continue
-
-            publisher.publish(out_msg)
-            self.get_logger().debug(
-                f"[DynamicPublish] topic={topic_name} -> republished "
-                f"value={val} ({pub_msg_cls.__name__})"
-            )
-
-        except Exception as e:
-            self.get_logger().error(f"Dynamic publish failed for {topic_name}: {e}")
-
-    # -------------------------
-    # Navigation Area / Execution UI / Global Path callbacks
-    # -------------------------
-    def navigation_area_callback(self, topic_name, msg):
-        """Handle /robot_navigation_area messages."""
-        area = msg.data.strip()
-        self.system_snapshot[topic_name] = {"data": area}
-        self.nav_area_tracker.update_area(area)
-
-    def execution_ui_callback(self, topic_name, msg):
-        """Handle /roboflow/execution_ui messages."""
-        state = msg.data.strip()
-        self.system_snapshot[topic_name] = {"data": state}
-        self.nav_area_tracker.update_execution_ui(state)
-
-    def global_path_callback(self, topic_name, msg):
-        """Handle global-path (nav_msgs/msg/Path) messages."""
-        self.path_deviation_tracker.update_path(msg)
-        self.system_snapshot[topic_name] = {
-            "num_poses": len(msg.poses),
-        }
-
-    # -------------------------
-    # Periodic Snapshot (timer_event)
-    # -------------------------
-    def periodic_snapshot_callback(self):
-        """
-        Periodically record all current data to MongoDB as a 'timer_event'.
-
-        This does NOT increment incidents and is excluded from MDBI calculations.
-        """
-        details = {
-            "system_snapshot": self.system_snapshot.copy(),
-            "metrics": self.get_metrics_snapshot(),
-            "navigation_area": self.nav_area_tracker.get_snapshot(),
-            "path_deviation": self.path_deviation_tracker.get_snapshot(),
-            "operation_mode": self.details.get("operation_mode"),
-            "estop": self.details.get("estop"),
-        }
-        self.log_event("timer_event", details)
-        self.get_logger().debug("[PeriodicSnapshot] timer_event logged to MongoDB")
-
-    def update_observed_mode_from_odom(self, is_moving: bool, now=None):
-        """
-        Fallback mode inference when there is no explicit /gophar/operation_mode.
-
-        Logic:
-          - If robot is moving AND we have recent /cmd_vel/collision_smoothed, mode = Autonomous
-          - If robot is moving AND no recent /cmd_vel/collision_smoothed, mode = Manual
-          - If robot is not moving, keep previous mode.
-          - If mode changes from AUTO -> MAN, log an intervention.
-        """
-        if not self.mode_observer_active:
-            return
-
-        if now is None:
-            now = self.get_clock().now()
-
-        prev_mode = self.details.get('operation_mode', self.MAN)
-        new_mode = prev_mode
-
-        auto_cmd_recent = False
-        if self.last_auto_cmd_time is not None:
-            dt = (now - self.last_auto_cmd_time).nanoseconds * 1e-9
-            auto_cmd_recent = dt <= self.mode_observer_cmd_timeout
-
-        self.get_logger().debug(
-            f"[ModeObserver] is_moving={is_moving}, auto_cmd_recent={auto_cmd_recent}, "
-            f"prev_mode={prev_mode}"
-        )
-
-        if not is_moving:
-            # Don't flip modes just because we stopped; keep previous
-            return
-
-        if auto_cmd_recent:
-            new_mode = self.AUTO
-        else:
-            new_mode = self.MAN
-
-        if new_mode == prev_mode:
-            return
-
-        self.get_logger().info(f"[ModeObserver] Observed mode change: {prev_mode} -> {new_mode}")
-
-        current_time = datetime.now()
-
-        # Track autonomous time like the explicit control_mode callback
-        if prev_mode == self.AUTO and new_mode == self.MAN:
-            if self.autonomous_start_time:
-                delta = (current_time - self.autonomous_start_time).total_seconds()
-                self.autonomous_time += delta
-                self.autonomous_start_time = None
-
-            # Observed manual override counts as an intervention
-            extra = {
-                "mode_source": "observed",
-                "observer_topic": self.mode_observer_topic_name,
-            }
-            self.trigger_intervention("Manual_override_observed", extra=extra, force_count=True)
-
-        elif prev_mode != self.AUTO and new_mode == self.AUTO:
-            self.autonomous_start_time = current_time
-
-        self.details['operation_mode'] = new_mode
-
-    def collision_nav_callback(self, topic_name, msg):
-        """
-        Store latest /cmd_vel/nav command.
-        """
-        now = self.get_clock().now()
-        self.last_nav_cmd = msg
-        self.last_nav_time = now
-
-        self.system_snapshot['cmd_vel_nav'] = {
-            'linear_x': msg.linear.x,
-            'linear_y': msg.linear.y,
-            'angular_z': msg.angular.z,
-        }
-
-        self.get_logger().debug(
-            f"[Collision] NAV cmd received: vx={msg.linear.x:.3f}, vy={msg.linear.y:.3f}, "
-            f"wz={msg.angular.z:.3f}"
-        )
-        # IMPORTANT: do NOT call check_collision_condition here
-
-    def collision_output_callback(self, topic_name, msg):
-        """
-        Store latest /cmd_vel/collision command and check for collision condition.
-        We only increment collision_incidents on the falling edge:
-        - previously had velocity on /cmd_vel/collision
-        - now ~zero velocity
-        - while /cmd_vel/nav still commands forward motion
-        """
-        now = self.get_clock().now()
-        self.last_collision_cmd = msg
-        self.last_collision_time = now
-
-        coll_vx = float(msg.linear.x)
-
-        self.system_snapshot['cmd_vel_collision'] = {
-            'linear_x': msg.linear.x,
-            'linear_y': msg.linear.y,
-            'angular_z': msg.angular.z,
-        }
-
-        self.get_logger().debug(
-            f"[Collision] COLLISION cmd received: vx={msg.linear.x:.3f}, vy={msg.linear.y:.3f}, "
-            f"wz={msg.angular.z:.3f}"
-        )
-
-        # Check for falling edge-based collision
-        self.check_collision_condition(now, coll_vx)
-
-    def check_collision_condition(self, now, coll_vx_now: float):
-        """
-        Detect a collision event only on falling edge:
-
-          - previous /cmd_vel/collision had velocity (|vx| > collision_zero_threshold)
-          - current /cmd_vel/collision has ~zero velocity (|vx| <= collision_zero_threshold)
-          - latest /cmd_vel/nav.linear.x > collision_nav_threshold
-          - nav command is recent (within collision_time_window)
-
-        When this condition is met:
-          - increment collision_incidents once
-          - log a 'Collision' event with full snapshot
-          - publish total collision_incidents
-
-        We only increment again if the cycle repeats:
-          velocity on /cmd_vel/collision -> zero -> velocity -> zero -> ...
-        """
-        # Only count collisions while the robot is in autonomous mode.
-        if self.details.get('operation_mode') != self.AUTO:
-            collision_abs_vx = abs(coll_vx_now)
-            if collision_abs_vx >= self.collision_moving_threshold:
-                self.collision_prev_has_velocity = True
-            elif collision_abs_vx <= self.collision_zero_threshold:
-                self.collision_prev_has_velocity = False
-            self.collision_zero_streak = 0
-            return
-
-        # Need a nav command to interpret the collision behaviour
-        if self.last_nav_cmd is None or self.last_nav_time is None:
-            self.get_logger().debug(
-                "[Collision] No NAV cmd yet; cannot evaluate collision condition."
-            )
-            collision_abs_vx = abs(coll_vx_now)
-            if collision_abs_vx >= self.collision_moving_threshold:
-                self.collision_prev_has_velocity = True
-            elif collision_abs_vx <= self.collision_zero_threshold:
-                self.collision_prev_has_velocity = False
-            self.collision_zero_streak = 0
-            return
-
-        # Check nav recency
-        dt_nav = (now - self.last_nav_time).nanoseconds * 1e-9
-        if dt_nav > self.collision_time_window:
-            self.get_logger().debug(
-                f"[Collision] NAV cmd too old ({dt_nav:.3f}s > {self.collision_time_window}s); "
-                "skipping collision evaluation."
-            )
-            collision_abs_vx = abs(coll_vx_now)
-            if collision_abs_vx >= self.collision_moving_threshold:
-                self.collision_prev_has_velocity = True
-            elif collision_abs_vx <= self.collision_zero_threshold:
-                self.collision_prev_has_velocity = False
-            self.collision_zero_streak = 0
-            return
-
-        nav_vx = float(self.last_nav_cmd.linear.x)
-
-        # Does nav actually request motion?
-        if nav_vx <= self.collision_nav_threshold:
-            self.get_logger().debug(
-                f"[Collision] NAV vx={nav_vx:.3f} <= nav_threshold={self.collision_nav_threshold}; "
-                "no forward motion requested."
-            )
-            collision_abs_vx = abs(coll_vx_now)
-            if collision_abs_vx >= self.collision_moving_threshold:
-                self.collision_prev_has_velocity = True
-            elif collision_abs_vx <= self.collision_zero_threshold:
-                self.collision_prev_has_velocity = False
-            self.collision_zero_streak = 0
-            return
-
-        # Hysteresis-based state on /cmd_vel/collision
-        collision_abs_vx = abs(coll_vx_now)
-        collision_is_zero_now = collision_abs_vx <= self.collision_zero_threshold
-        collision_has_velocity_now = collision_abs_vx >= self.collision_moving_threshold
-
-        self.get_logger().debug(
-            f"[Collision] prev_has_vel={self.collision_prev_has_velocity}, "
-            f"now_has_vel={collision_has_velocity_now}, now_is_zero={collision_is_zero_now}, "
-            f"coll_vx_now={coll_vx_now:.3f}, nav_vx={nav_vx:.3f}, zero_streak={self.collision_zero_streak}"
-        )
-
-        if collision_has_velocity_now:
-            self.collision_prev_has_velocity = True
-            self.collision_zero_streak = 0
-            return
-
-        if not collision_is_zero_now:
-            # In hysteresis band; keep previous state and wait for clearer signal.
-            return
-
-        self.collision_zero_streak += 1
-
-        # Falling edge with debounce: had velocity before, now zero for N consecutive samples.
-        if self.collision_prev_has_velocity and self.collision_zero_streak >= int(self.collision_zero_required_count):
-            if self.last_collision_logged_time is not None:
-                dt_coll = (now - self.last_collision_logged_time).nanoseconds * 1e-9
-                if dt_coll < self.collision_log_cooldown:
-                    self.get_logger().debug(
-                        f"[Collision] Cooldown active ({dt_coll:.3f}s < {self.collision_log_cooldown:.3f}s); skip log."
-                    )
-                    self.collision_prev_has_velocity = False
-                    self.collision_zero_streak = 0
-                    return
-
-            self.collision_incidents += 1
-            self.last_collision_logged_time = now
-            self.get_logger().info(
-                f"[Collision] Detected collision incident #{self.collision_incidents} "
-                f"(nav_vx={nav_vx:.3f}, coll_vx_now={coll_vx_now:.3f}, zero_count={self.collision_zero_streak})"
-            )
-            self.log_collision_event()
-            self.collision_prev_has_velocity = False
-            self.collision_zero_streak = 0
-
-    # -------------------------
-    # Timer & Logging
-    # -------------------------
-    def timer_callback(self):
-        hb = Bool()
-        hb.data = True
-        self.heartbeat_publisher.publish(hb)
-
-        now = self.get_clock().now()
-        time_since_move = (now - self.last_odom_update_time).nanoseconds * 1e-9
-
-        if time_since_move > self.stop_timeout and self.speed > 0.0:
-            self.get_logger().info(
-                f"[Timer] Robot has not moved for {time_since_move:.2f}s; "
-                "forcing speed to 0.0"
-            )
-            self.speed = 0.0
-            self.publish_speed(0.0)
-
-            # Update nav-area tracker with zero speed so status reflects stopped state
-            is_auto = self.details.get('operation_mode') == self.AUTO
-            self.nav_area_tracker.update_speed(0.0, is_auto)
-
-    def update_db_metrics(self):
-        # MBDI = autonomous_distance / incidents
-        if self.incidents != 0:
-            mdbi_val = float(self.autonomous_distance) / float(self.incidents)
-        else:
-            # No incidents → use autonomous distance as-is (no division)
-            mdbi_val = float(self.autonomous_distance)
-
-        self.get_logger().debug(
-            f"[DB] metrics update: dist={self.distance:.3f}, auto_dist={self.autonomous_distance:.3f}, "
-            f"incidents={self.incidents}, collisions={self.collision_incidents}, mdbi={mdbi_val:.3f}"
-        )
-
-        db_managers = [self.db_mgr_local]
-        if self.db_mgr_remote:
-            db_managers.append(self.db_mgr_remote)
-
-        for dbm in db_managers:
-            try:
-                dbm.update_distance(self.distance)
-                dbm.update_incidents(self.incidents)
-                dbm.update_autonomous_distance(self.autonomous_distance)
-                dbm.update_mdbi(mdbi_val)
-                dbm.update_collision_incidents(self.collision_incidents)
-            except Exception as e:
-                self.get_logger().warn(f"DB update failed: {e}")
-
-    def log_event(self, msg='', details=None):
-        if details is None:
-            details = {}
-
-        # Attach metrics to every event
-        details = {
-            **details,
-            'metrics': self.get_metrics_snapshot()
-        }
-
-        event_time = datetime.now(tz=timezone.utc)
-        event = {'time': event_time, 'event_type': msg, 'details': details}
-
-        self.get_logger().info(
-            f"[Event] type={msg}, time={event_time.isoformat()}, "
-            f"incidents={self.incidents}, collisions={self.collision_incidents}"
-        )
-
-        self.db_mgr_local.add_event(event)
-        if self.db_mgr_remote:
-            try:
-                self.db_mgr_remote.add_event(event)
-            except Exception as e:
-                self.get_logger().warn(f"Remote DB event log failed: {e}")
-
-        incidents_msg = Int32()
-        incidents_msg.data = self.incidents
-        self.incidents_publisher.publish(incidents_msg)
-
-        self.update_db_metrics()
-
-    def log_collision_event(self):
-        """
-        Log a 'Collision' event, capturing:
-          - full system snapshot
-          - nav & collision commands
-          - total incidents and collision_incidents
-        """
-        details = {
-            "collision_incident_index": self.collision_incidents,
-            "incidents": self.incidents,
-            "collision_incidents": self.collision_incidents,
-            "total_incidents": self.incidents + self.collision_incidents,
-            "nav_cmd": {
-                "linear": {
-                    "x": float(self.last_nav_cmd.linear.x),
-                    "y": float(self.last_nav_cmd.linear.y),
+    def _serialize_topic_value(self, topic_cfg: dict, msg):
+        role = topic_cfg.get("role", "")
+        if role in {"autonomous_mode", "intervention_heartbeat"}:
+            return {"value": bool(msg.data)}
+        if role == "robot_state":
+            return {"value": str(msg.data)}
+        if role in {"distance_odometry", "global_pose_odometry"}:
+            return {
+                "frame_id": msg.header.frame_id,
+                "position": {
+                    "x": float(msg.pose.pose.position.x),
+                    "y": float(msg.pose.pose.position.y),
+                    "z": float(msg.pose.pose.position.z),
                 },
-                "angular": {
-                    "z": float(self.last_nav_cmd.angular.z),
+                "linear_speed_mps": float(msg.twist.twist.linear.x),
+            }
+        if role == "global_path":
+            pose_count = len(msg.poses)
+            data = {"pose_count": pose_count}
+            if pose_count > 0:
+                start = msg.poses[0].pose.position
+                end = msg.poses[-1].pose.position
+                data["start"] = {"x": float(start.x), "y": float(start.y)}
+                data["end"] = {"x": float(end.x), "y": float(end.y)}
+            return data
+        return ros_msg_to_dict(msg)
+
+    def _handle_autonomous_mode(self, msg: Bool):
+        new_mode = bool(msg.data)
+        if new_mode == self.autonomous_mode:
+            return
+
+        previous_mode = self.autonomous_mode
+        failing_heartbeats = self._get_failing_intervention_heartbeats()
+        self._advance_mode_clock(new_mode)
+
+        transition_details = {
+            "previous_mode": AUTONOMOUS_LABEL if previous_mode else MANUAL_LABEL,
+            "new_mode": AUTONOMOUS_LABEL if new_mode else MANUAL_LABEL,
+            "failing_heartbeats": failing_heartbeats,
+        }
+        self._log_event("mode_transition", transition_details)
+
+        if previous_mode and not new_mode and failing_heartbeats:
+            self.intervention_count += 1
+            self.last_intervention_details = {
+                "time": self._now_datetime().isoformat(),
+                "failing_heartbeats": failing_heartbeats,
+            }
+            self._log_event(
+                "intervention",
+                {
+                    "intervention_index": self.intervention_count,
+                    "failing_heartbeats": failing_heartbeats,
+                },
+            )
+
+    def _handle_intervention_heartbeat(self, topic_cfg: dict, msg: Bool):
+        heartbeat_key = topic_cfg.get("metric_key") or topic_cfg["name"]
+        self.intervention_heartbeat_states[heartbeat_key] = bool(msg.data)
+
+    def _handle_robot_state(self, msg: String):
+        new_state = self._normalize_robot_state(str(msg.data))
+        previous_state = self.robot_state
+        self.robot_state = new_state
+
+        if (
+            previous_state == ROBOT_STATE_ACTIVE
+            and new_state == ROBOT_STATE_DISABLED
+            and self.autonomous_mode
+        ):
+            self.active_to_disabled_in_autonomous_count += 1
+            self._log_event(
+                "robot_state_active_to_disabled_in_autonomous",
+                {
+                    "count": self.active_to_disabled_in_autonomous_count,
+                    "previous_state": previous_state,
+                    "new_state": new_state,
+                },
+            )
+
+    def _handle_distance_odometry(self, msg: Odometry):
+        now_sec = self._now_sec()
+        self.last_speed_update_sec = now_sec
+        self.current_speed_mps = abs(float(msg.twist.twist.linear.x))
+
+        position = msg.pose.pose.position
+        current_position = (float(position.x), float(position.y))
+        if self.last_motion_position is None:
+            self.last_motion_position = current_position
+            self.first_motion_time_sec = now_sec
+            self.last_motion_time_sec = now_sec
+            return
+
+        dx = current_position[0] - self.last_motion_position[0]
+        dy = current_position[1] - self.last_motion_position[1]
+        step_distance_m = math.hypot(dx, dy)
+
+        if step_distance_m >= self.distance_epsilon_m:
+            self.total_distance_m += step_distance_m
+            self.distance_by_mode_m[self._mode_label()] += step_distance_m
+            if self.current_area:
+                self.area_distance_m[self.current_area] += step_distance_m
+
+        self.last_motion_position = current_position
+        self.last_motion_time_sec = now_sec
+
+    def _handle_navigation_area(self, msg: String):
+        new_area = str(msg.data).strip()
+        now_sec = self._now_sec()
+
+        if new_area == self.current_area:
+            return
+
+        if self.current_area is not None and self.area_entered_at is not None:
+            self.area_totals_sec[self.current_area] += now_sec - self.area_entered_at
+
+        self.current_area = new_area
+        self.area_entered_at = now_sec
+        self.area_visit_count[new_area] += 1
+        self._log_event("navigation_area_transition", {"new_area": new_area})
+
+    def _handle_global_path(self, msg: PathMsg):
+        self.current_path = [
+            (
+                float(pose.pose.position.x),
+                float(pose.pose.position.y),
+            )
+            for pose in msg.poses
+        ]
+
+    def _handle_global_pose(self, msg: Odometry):
+        if len(self.current_path) < 2:
+            return
+
+        position = msg.pose.pose.position
+        x = float(position.x)
+        y = float(position.y)
+        current_deviation = min(
+            self._point_to_segment_distance(
+                x,
+                y,
+                self.current_path[index],
+                self.current_path[index + 1],
+            )
+            for index in range(len(self.current_path) - 1)
+        )
+        self.current_path_deviation_m = current_deviation
+        self.path_deviation_sum_m += current_deviation
+        self.path_deviation_samples += 1
+        self.max_path_deviation_m = max(self.max_path_deviation_m, current_deviation)
+
+    def _advance_mode_clock(self, new_mode: bool):
+        now_sec = self._now_sec()
+        old_label = self._mode_label()
+        self.mode_totals_sec[old_label] += now_sec - self.mode_entered_at
+        self.autonomous_mode = new_mode
+        self.mode_entered_at = now_sec
+
+    def _mode_label(self) -> str:
+        return AUTONOMOUS_LABEL if self.autonomous_mode else MANUAL_LABEL
+
+    def _get_mode_totals_sec(self) -> dict:
+        totals = dict(self.mode_totals_sec)
+        totals[self._mode_label()] += self._now_sec() - self.mode_entered_at
+        return totals
+
+    def _get_area_totals_sec(self) -> dict:
+        totals = dict(self.area_totals_sec)
+        if self.current_area is not None and self.area_entered_at is not None:
+            totals[self.current_area] = totals.get(self.current_area, 0.0) + (
+                self._now_sec() - self.area_entered_at
+            )
+        return totals
+
+    def _get_failing_intervention_heartbeats(self) -> list[str]:
+        return sorted(
+            [
+                name
+                for name, is_healthy in self.intervention_heartbeat_states.items()
+                if is_healthy is False
+            ]
+        )
+
+    def _build_summary(self) -> dict:
+        now_sec = self._now_sec()
+        mode_times_sec = self._get_mode_totals_sec()
+        area_times_sec = self._get_area_totals_sec()
+
+        if (
+            self.last_speed_update_sec is not None
+            and now_sec - self.last_speed_update_sec > self.stale_speed_timeout_sec
+        ):
+            live_speed_mps = 0.0
+        else:
+            live_speed_mps = self.current_speed_mps
+
+        elapsed_motion_time = 0.0
+        if self.first_motion_time_sec is not None and self.last_motion_time_sec is not None:
+            elapsed_motion_time = max(0.0, self.last_motion_time_sec - self.first_motion_time_sec)
+
+        average_speed_mps = (
+            self.total_distance_m / elapsed_motion_time if elapsed_motion_time > 0.0 else 0.0
+        )
+
+        if self.intervention_count > 0:
+            mdbi_m = self.distance_by_mode_m[AUTONOMOUS_LABEL] / self.intervention_count
+        else:
+            mdbi_m = None
+
+        area_metrics = {}
+        for area_name in sorted(set(KNOWN_AREAS).union(area_times_sec).union(self.area_distance_m)):
+            total_time = float(area_times_sec.get(area_name, 0.0))
+            total_distance = float(self.area_distance_m.get(area_name, 0.0))
+            visit_count = int(self.area_visit_count.get(area_name, 0))
+            area_metrics[area_name] = {
+                "total_time_sec": total_time,
+                "average_time_per_visit_sec": total_time / visit_count if visit_count else 0.0,
+                "distance_m": total_distance,
+                "average_speed_mps": total_distance / total_time if total_time > 0.0 else 0.0,
+                "visits": visit_count,
+            }
+
+        path_deviation_average_m = (
+            self.path_deviation_sum_m / self.path_deviation_samples
+            if self.path_deviation_samples
+            else 0.0
+        )
+
+        return {
+            "timestamp": self._now_datetime().isoformat(),
+            "mode": {
+                "autonomous": self.autonomous_mode,
+                "label": self._mode_label(),
+                "time_sec": {
+                    AUTONOMOUS_LABEL: float(mode_times_sec[AUTONOMOUS_LABEL]),
+                    MANUAL_LABEL: float(mode_times_sec[MANUAL_LABEL]),
+                },
+                "distance_m": {
+                    AUTONOMOUS_LABEL: float(self.distance_by_mode_m[AUTONOMOUS_LABEL]),
+                    MANUAL_LABEL: float(self.distance_by_mode_m[MANUAL_LABEL]),
                 },
             },
-            "collision_cmd": {
-                "linear": {
-                    "x": float(self.last_collision_cmd.linear.x),
-                    "y": float(self.last_collision_cmd.linear.y),
-                },
-                "angular": {
-                    "z": float(self.last_collision_cmd.angular.z),
-                },
+            "interventions": {
+                "count": int(self.intervention_count),
+                "failing_heartbeats": self._get_failing_intervention_heartbeats(),
+                "last": self.last_intervention_details,
             },
-            # Full snapshot of all system data at this moment
-            "system_snapshot": self.system_snapshot.copy(),
+            "mdbi_m": mdbi_m,
+            "mdbi_status": "defined" if mdbi_m is not None else "undefined_until_first_intervention",
+            "robot_state": {
+                "current": self.robot_state,
+                "active_to_disabled_in_autonomous_count": int(
+                    self.active_to_disabled_in_autonomous_count
+                ),
+            },
+            "motion": {
+                "total_distance_m": float(self.total_distance_m),
+                "current_speed_mps": float(live_speed_mps),
+                "average_speed_mps": float(average_speed_mps),
+            },
+            "navigation_area": {
+                "current": self.current_area,
+                "states": area_metrics,
+            },
+            "path_deviation": {
+                "current_m": float(self.current_path_deviation_m or 0.0),
+                "average_m": float(path_deviation_average_m),
+                "max_m": float(self.max_path_deviation_m),
+                "samples": int(self.path_deviation_samples),
+            },
+            "heartbeats": {
+                key: value for key, value in sorted(self.intervention_heartbeat_states.items())
+            },
         }
 
-        self.get_logger().info(
-            f"[Collision] Logging collision event #{self.collision_incidents} "
-            f"(total_incidents={details['total_incidents']})"
+    def _build_snapshot(self) -> dict:
+        topics = {
+            topic_name: self.latest_topic_values.get(topic_name)
+            for topic_name in sorted(self.snapshot_topics)
+            if topic_name in self.latest_topic_values
+        }
+        return {
+            "time": self._now_datetime(),
+            "summary": self._build_summary(),
+            "topics": topics,
+        }
+
+    def _log_event(self, event_type: str, details: dict):
+        event = {
+            "time": self._now_datetime(),
+            "event_type": event_type,
+            "details": details,
+            "summary": self._build_summary(),
+        }
+
+        for db_manager in self.db_managers:
+            try:
+                db_manager.add_event(event)
+                db_manager.update_session_summary(event["summary"])
+            except Exception as exc:
+                self.get_logger().warn(f"Failed to write event '{event_type}' to MongoDB: {exc}")
+
+    def _snapshot_timer_callback(self):
+        snapshot = self._build_snapshot()
+        for db_manager in self.db_managers:
+            try:
+                db_manager.add_snapshot(snapshot)
+                db_manager.update_session_summary(snapshot["summary"])
+            except Exception as exc:
+                self.get_logger().warn(f"Failed to write periodic snapshot to MongoDB: {exc}")
+
+    def _heartbeat_timer_callback(self):
+        summary = self._build_summary()
+
+        heartbeat_msg = Bool()
+        heartbeat_msg.data = True
+        self.heartbeat_publisher.publish(heartbeat_msg)
+
+        mode_msg = String()
+        mode_msg.data = summary["mode"]["label"]
+        self.mode_publisher.publish(mode_msg)
+
+        interventions_msg = Int32()
+        interventions_msg.data = summary["interventions"]["count"]
+        self.interventions_publisher.publish(interventions_msg)
+
+        mdbi_msg = Float32()
+        mdbi_msg.data = float(summary["mdbi_m"]) if summary["mdbi_m"] is not None else float("nan")
+        self.mdbi_publisher.publish(mdbi_msg)
+
+        transition_msg = Int32()
+        transition_msg.data = summary["robot_state"][
+            "active_to_disabled_in_autonomous_count"
+        ]
+        self.robot_state_transition_publisher.publish(transition_msg)
+
+        self._publish_float(self.total_distance_publisher, summary["motion"]["total_distance_m"])
+        self._publish_float(
+            self.autonomous_distance_publisher,
+            summary["mode"]["distance_m"][AUTONOMOUS_LABEL],
+        )
+        self._publish_float(
+            self.manual_distance_publisher,
+            summary["mode"]["distance_m"][MANUAL_LABEL],
+        )
+        self._publish_float(
+            self.current_speed_publisher, summary["motion"]["current_speed_mps"]
+        )
+        self._publish_float(
+            self.average_speed_publisher, summary["motion"]["average_speed_mps"]
+        )
+        self._publish_float(
+            self.autonomous_time_publisher, summary["mode"]["time_sec"][AUTONOMOUS_LABEL]
+        )
+        self._publish_float(
+            self.manual_time_publisher, summary["mode"]["time_sec"][MANUAL_LABEL]
         )
 
-        # This will attach metrics (distance, speed, battery, etc.) and write to DB
-        self.log_event("Collision", details)
+        area_msg = String()
+        area_msg.data = self.current_area or "UNKNOWN"
+        self.navigation_area_publisher.publish(area_msg)
 
-        # Publish total collisions on a dedicated topic
-        msg = Int32()
-        msg.data = int(self.collision_incidents)
-        self.collision_incidents_publisher.publish(msg)
+        self._publish_float(
+            self.path_deviation_current_publisher,
+            summary["path_deviation"]["current_m"],
+        )
+        self._publish_float(
+            self.path_deviation_average_publisher,
+            summary["path_deviation"]["average_m"],
+        )
+        self._publish_float(
+            self.path_deviation_max_publisher, summary["path_deviation"]["max_m"]
+        )
 
-    def publish_distance(self, dist):
+        summary_msg = String()
+        summary_msg.data = json.dumps(summary, sort_keys=True)
+        self.summary_publisher.publish(summary_msg)
+
+    def _publish_float(self, publisher, value: float):
         msg = Float32()
-        msg.data = float(dist)
-        self.distance_publisher.publish(msg)
-        self.get_logger().debug(f"[Publish] distance={dist:.3f}")
-        self.update_db_metrics()
+        msg.data = float(value)
+        publisher.publish(msg)
 
-    def publish_speed(self, speed):
-        msg = Float32()
-        msg.data = float(speed)
-        self.speed_publisher.publish(msg)
-        self.get_logger().debug(f"[Publish] speed={speed:.3f}")
+    def _normalize_robot_state(self, raw_state: str) -> str:
+        stripped = raw_state.strip()
+        lowered = stripped.lower()
+        if lowered in {"disable", "disabled"}:
+            return ROBOT_STATE_DISABLED
+        if lowered == "active":
+            return ROBOT_STATE_ACTIVE
+        if lowered == "enabled":
+            return "Enabled"
+        return stripped or "Unknown"
 
-    def get_git_info(self, repo_path):
-        """
-        Return basic git metadata for a repo.
+    def _now_datetime(self) -> datetime:
+        return datetime.now(tz=timezone.utc)
 
-        Example schema:
-        {
-            "path": "/home/ros/aoc_strawberry_scenario_ws/src/aoc_strawberry_scenario",
-            "exists": True,
-            "remote": "git@github.com:LCAS/aoc_strawberry_scenario.git",
-            "branch": "main",
-            "commit": "f3a6c1b4e6f8c3b3c823f2c45e56a123456789ab",
-            "short_commit": "f3a6c1b",
-            "commit_message": "Fix navsat transform delay",
-            "tags": ["v0.3.1"],
-            "describe": "v0.3.1-2-gf3a6c1b",
-            "dirty": false,
-            "error": null
-        }
-        """
-        info = {
-            "path": repo_path,
-            "exists": False,
-            "remote": None,
-            "branch": None,
-            "commit": None,
-            "short_commit": None,
-            "commit_message": None,  # NEW
-            "tags": [],              # NEW
-            "describe": None,        # NEW
-            "dirty": None,
-            "error": None,
-        }
+    def _now_sec(self) -> float:
+        return self.get_clock().now().nanoseconds * 1e-9
 
-        try:
-            if not repo_path or not os.path.isdir(repo_path):
-                info["error"] = "Path does not exist or is not a directory"
-                return info
-
-            def git(args):
-                result = subprocess.run(
-                    ["git", "-C", repo_path] + args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip())
-                return result.stdout.strip()
-
-            info["exists"] = True
-
-            # Remote
-            try:
-                info["remote"] = git(["config", "--get", "remote.origin.url"])
-            except Exception:
-                info["remote"] = None
-
-            # Branch
-            try:
-                info["branch"] = git(["rev-parse", "--abbrev-ref", "HEAD"])
-            except Exception:
-                info["branch"] = None
-
-            # Commit hashes
-            try:
-                info["commit"] = git(["rev-parse", "HEAD"])
-            except Exception:
-                info["commit"] = None
-
-            try:
-                info["short_commit"] = git(["rev-parse", "--short", "HEAD"])
-            except Exception:
-                info["short_commit"] = None
-
-            # NEW: Last commit message (full body or just subject)
-            try:
-                info["commit_message"] = git(["log", "-1", "--pretty=%s"])
-            except Exception:
-                info["commit_message"] = None
-
-            # NEW: Tags pointing at HEAD
-            try:
-                tags_str = git(["tag", "--points-at", "HEAD"])
-                if tags_str:
-                    info["tags"] = tags_str.splitlines()
-                else:
-                    info["tags"] = []
-            except Exception:
-                info["tags"] = []
-
-            # NEW: git describe (nearest tag + distance)
-            try:
-                info["describe"] = git(["describe", "--tags", "--always"])
-            except Exception:
-                info["describe"] = None
-
-            # Dirty / clean state
-            try:
-                status = git(["status", "--porcelain"])
-                info["dirty"] = bool(status)
-            except Exception:
-                info["dirty"] = None
-
-        except Exception as e:
-            info["error"] = str(e)
-
-        return info
+    @staticmethod
+    def _point_to_segment_distance(px, py, start, end) -> float:
+        start_x, start_y = start
+        end_x, end_y = end
+        delta_x = end_x - start_x
+        delta_y = end_y - start_y
+        segment_length_sq = delta_x * delta_x + delta_y * delta_y
+        if segment_length_sq == 0.0:
+            return math.hypot(px - start_x, py - start_y)
+        projection = max(
+            0.0,
+            min(
+                1.0,
+                ((px - start_x) * delta_x + (py - start_y) * delta_y) / segment_length_sq,
+            ),
+        )
+        proj_x = start_x + projection * delta_x
+        proj_y = start_y + projection * delta_y
+        return math.hypot(px - proj_x, py - proj_y)
 
 
 def main(args=None):
@@ -1303,17 +759,19 @@ def main(args=None):
     node = AutonomyMetricsLogger()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.get_logger().info("Shutting down AutonomyMetricsLogger (KeyboardInterrupt).")
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
-        node.get_logger().info(
-            f"Final stats: distance={node.distance:.3f}, auto_distance={node.autonomous_distance:.3f}, "
-            f"incidents={node.incidents}, collisions={node.collision_incidents}"
-        )
-        node.destroy_node()
-        rclpy.shutdown()
+        final_summary = node._build_summary()
+        for db_manager in node.db_managers:
+            try:
+                db_manager.mark_session_end(final_summary)
+            except Exception as exc:
+                node.get_logger().warn(f"Failed to mark session end in MongoDB: {exc}")
+        if node.context.ok():
+            node.destroy_node()
+            rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

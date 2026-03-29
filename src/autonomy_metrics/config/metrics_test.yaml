@@ -3,24 +3,14 @@ git_repos_base_path: "/home/ros/aoc_strawberry_scenario_ws/src/aoc_strawberry_sc
 git_repos:
   scenario: "."
   autonomy_metrics_logger: "jabas/autonomy_metrics_logger"
-  navfn_planner: "jabas/navfn_planner"
-  perception_boundary_estimator: "jabas/perception_boundary_estimator"
-  pointcloud_processing: "jabas/pointcloud_processing"
-  robot_boundary_checker: "jabas/robot_boundary_checker"
-  ros2_topic_monitor: "jabas/ros2_topic_monitor"
-  row_nav_planner: "jabas/row_nav_planner"
-  ppl_gofar_platform: "robots/ppl_gofar_platform"
-  topological_navigation: "contrib/topological_navigation"
-  sentor: "contrib/sentor"
-  kiss_icp: "contrib/kiss-icp"
 
 runtime:
   heartbeat_topic: "/autonomy_metrics/heartbeat"
   session_summary_topic: "/autonomy_metrics/session_summary_json"
-  heartbeat_period_sec: 1.0
-  snapshot_interval_sec: 10.0
+  heartbeat_period_sec: 0.5
+  snapshot_interval_sec: 2.0
   distance_epsilon_m: 0.01
-  stale_speed_timeout_sec: 2.0
+  stale_speed_timeout_sec: 1.0
 
 topics:
   - name: "/autonomous_mode"

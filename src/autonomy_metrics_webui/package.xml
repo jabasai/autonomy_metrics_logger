@@ -1,18 +1,18 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>autonomy_metrics</name>
+  <name>autonomy_metrics_webui</name>
   <version>0.1.0</version>
-  <description>Config-driven autonomy metrics logger with MongoDB session logging and operational robustness metrics.</description>
+  <description>Web UI package for live autonomy metrics, intervention history, and robustness monitoring.</description>
+
   <maintainer email="ibrahim.hroub7@gmail.com">Ibrahim</maintainer>
   <license>Apache 2.0</license>
 
-  <depend>rclpy</depend>
-  <depend>std_msgs</depend>
-  <depend>nav_msgs</depend>
-  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>autonomy_metrics</exec_depend>
+  <exec_depend>python3-flask</exec_depend>
   <exec_depend>python3-pymongo</exec_depend>
-  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 
