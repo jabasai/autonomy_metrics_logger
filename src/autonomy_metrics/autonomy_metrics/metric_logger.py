@@ -110,8 +110,6 @@ class AutonomyMetricsLogger(Node):
         self.declare_parameter('enable_remote_logging', False)
         self.declare_parameter('min_distance_threshold', 0.2)
         self.declare_parameter('stop_timeout', 2.0)
-        self.declare_parameter('mode_observer_cmd_timeout', 1.0)         # seconds
-        self.declare_parameter('mode_observer_speed_threshold', 0.01)    # m/s
         # Collision detection tuning
         self.declare_parameter('collision_nav_threshold', 0.01)      # nav cmd must be > this
         self.declare_parameter('collision_zero_threshold', 0.001)    # collision cmd abs(linear.x) <= this
@@ -122,8 +120,6 @@ class AutonomyMetricsLogger(Node):
         self.collision_zero_threshold = self.get_parameter('collision_zero_threshold').get_parameter_value().double_value
         self.collision_time_window = self.get_parameter('collision_time_window').get_parameter_value().double_value
         self.collision_log_cooldown = self.get_parameter('collision_log_cooldown').get_parameter_value().double_value
-        self.mode_observer_cmd_timeout = self.get_parameter('mode_observer_cmd_timeout').get_parameter_value().double_value
-        self.mode_observer_speed_threshold = self.get_parameter('mode_observer_speed_threshold').get_parameter_value().double_value
         self.config_path = self.get_parameter('config_yaml').get_parameter_value().string_value
         self.mongo_host = self.get_parameter('mongodb_host').get_parameter_value().string_value
         self.mongo_port = self.get_parameter('mongodb_port').get_parameter_value().integer_value
@@ -161,13 +157,6 @@ class AutonomyMetricsLogger(Node):
         self.AUTO = 'Autonomous'
         self.MAN = 'Manual'
         self.details = {'estop': False, 'operation_mode': self.AUTO}
-
-        # Mode observation (velocity-based fallback when no "operation_mode" topic available)
-        self.has_explicit_control_mode = False
-        self.mode_observer_enabled = False
-        self.mode_observer_active = False
-        self.mode_observer_topic_name = None
-        self.last_auto_cmd_time = None
 
         # Collision monitoring
         self.collision_incidents = 0
@@ -212,14 +201,6 @@ class AutonomyMetricsLogger(Node):
         self.heartbeat_timer = self.create_timer(1.0, self.timer_callback)
 
         self.load_and_setup_config()
-
-        # Use the observer only if there is no explicit control_mode topic configured
-        self.mode_observer_active = self.mode_observer_enabled and not self.has_explicit_control_mode
-        if self.mode_observer_active:
-            self.get_logger().info(
-                f"Mode observer enabled using topic {self.mode_observer_topic_name} "
-                "(no explicit control_mode topic configured)"
-            )
 
         # Init Session
         env_variables = {
@@ -274,12 +255,6 @@ class AutonomyMetricsLogger(Node):
 
         topics = self.config.get('topics', [])
 
-        # Detect if an explicit control mode topic is configured
-        self.has_explicit_control_mode = any(
-            (t.get('role', '').lower() == 'control_mode') for t in topics
-        )
-        self.get_logger().info(f"Explicit control_mode topic present: {self.has_explicit_control_mode}")
-
         for item in topics:
             name = item.get('name')
             type_str = item.get('type')
@@ -289,13 +264,6 @@ class AutonomyMetricsLogger(Node):
                 continue
 
             self.topic_cfg_map[name] = item
-
-            role = item.get('role', '').lower()
-
-            if role == 'mode_observer':
-                self.mode_observer_enabled = True
-                self.mode_observer_topic_name = name
-                self.get_logger().info(f"Mode observer configured on topic: {name}")
 
             # Dynamic Publisher Setup
             pub_cfg = item.get('publish', {})
@@ -474,10 +442,6 @@ class AutonomyMetricsLogger(Node):
         self.speed = dist / time_diff if time_diff > 0 else 0.0
         self.distance += dist
 
-        # Use observed mode if enabled (fallback when no explicit control_mode topic)
-        is_moving = self.speed > self.mode_observer_speed_threshold
-        self.update_observed_mode_from_odom(is_moving=is_moving, now=current_time)
-
         if self.details.get('operation_mode') == self.AUTO:
             self.autonomous_distance += dist
 
@@ -565,18 +529,6 @@ class AutonomyMetricsLogger(Node):
 
     def generic_callback(self, topic_name, msg, log_fields):
         cfg = self.topic_cfg_map.get(topic_name, {})
-        role = cfg.get('role', '').lower()
-
-        # Mode observer special-case
-        if role == 'mode_observer':
-            self.last_auto_cmd_time = self.get_clock().now()
-            self.system_snapshot['mode_observer'] = {
-                'topic': topic_name
-            }
-            self.get_logger().debug(
-                f"[ModeObserver] Received command on {topic_name}, "
-                f"marking recent autonomous command."
-            )
 
         data = {}
         log_all = bool(cfg.get("log_all_fields", False))
@@ -654,70 +606,6 @@ class AutonomyMetricsLogger(Node):
 
         except Exception as e:
             self.get_logger().error(f"Dynamic publish failed for {topic_name}: {e}")
-
-    def update_observed_mode_from_odom(self, is_moving: bool, now=None):
-        """
-        Fallback mode inference when there is no explicit /gophar/operation_mode.
-
-        Logic:
-          - If robot is moving AND we have recent /cmd_vel/collision_smoothed, mode = Autonomous
-          - If robot is moving AND no recent /cmd_vel/collision_smoothed, mode = Manual
-          - If robot is not moving, keep previous mode.
-          - If mode changes from AUTO -> MAN, log an intervention.
-        """
-        if not self.mode_observer_active:
-            return
-
-        if now is None:
-            now = self.get_clock().now()
-
-        prev_mode = self.details.get('operation_mode', self.MAN)
-        new_mode = prev_mode
-
-        auto_cmd_recent = False
-        if self.last_auto_cmd_time is not None:
-            dt = (now - self.last_auto_cmd_time).nanoseconds * 1e-9
-            auto_cmd_recent = dt <= self.mode_observer_cmd_timeout
-
-        self.get_logger().debug(
-            f"[ModeObserver] is_moving={is_moving}, auto_cmd_recent={auto_cmd_recent}, "
-            f"prev_mode={prev_mode}"
-        )
-
-        if not is_moving:
-            # Don't flip modes just because we stopped; keep previous
-            return
-
-        if auto_cmd_recent:
-            new_mode = self.AUTO
-        else:
-            new_mode = self.MAN
-
-        if new_mode == prev_mode:
-            return
-
-        self.get_logger().info(f"[ModeObserver] Observed mode change: {prev_mode} -> {new_mode}")
-
-        current_time = datetime.now()
-
-        # Track autonomous time like the explicit control_mode callback
-        if prev_mode == self.AUTO and new_mode == self.MAN:
-            if self.autonomous_start_time:
-                delta = (current_time - self.autonomous_start_time).total_seconds()
-                self.autonomous_time += delta
-                self.autonomous_start_time = None
-
-            # Observed manual override counts as an intervention
-            extra = {
-                "mode_source": "observed",
-                "observer_topic": self.mode_observer_topic_name,
-            }
-            self.trigger_intervention("Manual_override_observed", extra=extra, force_count=True)
-
-        elif prev_mode != self.AUTO and new_mode == self.AUTO:
-            self.autonomous_start_time = current_time
-
-        self.details['operation_mode'] = new_mode
 
     def collision_nav_callback(self, topic_name, msg):
         """

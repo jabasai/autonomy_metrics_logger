@@ -62,19 +62,6 @@ def generate_launch_description():
         description='Timeout (s) after last odom movement before speed is forced to 0',
     )
 
-    # Mode observer (velocity-based control mode inference)
-    mode_observer_cmd_timeout_arg = DeclareLaunchArgument(
-        'mode_observer_cmd_timeout',
-        default_value='1.0',
-        description='Time window (s) in which a cmd_vel command is considered recent for mode observer',
-    )
-
-    mode_observer_speed_threshold_arg = DeclareLaunchArgument(
-        'mode_observer_speed_threshold',
-        default_value='0.01',
-        description='Speed (m/s) above which robot is considered moving for mode observer',
-    )
-
     # Collision monitor (nav vs collision output)
     collision_nav_threshold_arg = DeclareLaunchArgument(
         'collision_nav_threshold',
@@ -112,9 +99,6 @@ def generate_launch_description():
     min_distance_threshold = LaunchConfiguration('min_distance_threshold')
     stop_timeout = LaunchConfiguration('stop_timeout')
 
-    mode_observer_cmd_timeout = LaunchConfiguration('mode_observer_cmd_timeout')
-    mode_observer_speed_threshold = LaunchConfiguration('mode_observer_speed_threshold')
-
     collision_nav_threshold = LaunchConfiguration('collision_nav_threshold')
     collision_zero_threshold = LaunchConfiguration('collision_zero_threshold')
     collision_time_window = LaunchConfiguration('collision_time_window')
@@ -138,9 +122,6 @@ def generate_launch_description():
             'min_distance_threshold': min_distance_threshold,
             'stop_timeout': stop_timeout,
 
-            'mode_observer_cmd_timeout': mode_observer_cmd_timeout,
-            'mode_observer_speed_threshold': mode_observer_speed_threshold,
-
             'collision_nav_threshold': collision_nav_threshold,
             'collision_zero_threshold': collision_zero_threshold,
             'collision_time_window': collision_time_window,
@@ -157,8 +138,6 @@ def generate_launch_description():
         enable_remote_logging_arg,
         min_distance_threshold_arg,
         stop_timeout_arg,
-        mode_observer_cmd_timeout_arg,
-        mode_observer_speed_threshold_arg,
         collision_nav_threshold_arg,
         collision_zero_threshold_arg,
         collision_time_window_arg,

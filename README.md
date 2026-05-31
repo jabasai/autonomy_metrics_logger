@@ -5,7 +5,7 @@
 - Tracks travelled distance, autonomous distance, incidents, and collisions.
 - Logs interventions and collisions to MongoDB with a full snapshot of system state.
 - Is configured entirely via a YAML file (topics, fields, triggers, dynamic publishers).
-- Supports both explicit operation mode (`/gophar/operation_mode`) and inferred mode (odom + velocity).
+- Determines operation mode (`Autonomous` / `Manual`) from an explicit topic such as `/gophar/operation_mode`.
 
 ---
 
@@ -22,7 +22,7 @@ The node:
    - `incidents` (interventions in autonomous mode, plus manual overrides)
    - `collision_incidents` (collision monitor only, separate from incidents)
 5. Logs events to MongoDB **only** when something happens:
-   - Manual override (explicit or observed)
+   - Manual override (explicit `control_mode` topic transition Auto → Manual)
    - E-stop
    - Faults / joy overrides / other YAML triggers
    - Collisions (nav vs collision velocity)
@@ -129,27 +129,6 @@ All parameters are exposed through the launch file.
 | `min_distance_threshold` | double | `0.2`         | Min odom step (m) required for distance update.        |
 | `stop_timeout`           | double | `2.0`         | Time (s) after last odom update before speed is set 0. |
 
-### Mode observer (fallback mode inference)
-
-Used **only** if no topic with `role: "control_mode"` is configured.
-
-| Parameter                       | Type   | Default | Description                                                              |
-| ------------------------------- | ------ | ------- | ------------------------------------------------------------------------ |
-| `mode_observer_cmd_timeout`     | double | `1.0`   | Commands on `mode_observer` topic are “recent” within this many seconds. |
-| `mode_observer_speed_threshold` | double | `0.01`  | Robot is considered moving if speed > this (m/s).                        |
-
-Logic when active:
-
-* Topic with `role: "mode_observer"` (e.g. `/cmd_vel/collision_smoothed`) marks last command time.
-* If odometry reports movement and:
-
-  * cmd is recent → mode = Autonomous
-  * cmd is not recent → mode = Manual
-* When observed mode changes from Auto → Manual:
-
-  * `Manual_override_observed` event is logged.
-  * An incident is counted (MDBI).
-
 ### Collision monitor (nav vs collision velocity)
 
 | Parameter                  | Type   | Default | Description                                                                                   |
@@ -245,11 +224,6 @@ topics:
       enable: true
       event_type: "Joy_override"
 
-  - name: "/cmd_vel/collision_smoothed"
-    type: "geometry_msgs/msg/Twist"
-    role: "mode_observer"
-    log_fields: []
-
   - name: "/cmd_vel/nav"
     type: "geometry_msgs/msg/Twist"
     role: "collision_nav"
@@ -301,7 +275,6 @@ Common fields:
   * `"control_mode"`: explicit operation mode (`Autonomous` vs `Manual`).
   * `"estop"`: emergency stop; used to generate `EMS` incidents.
   * `"system_status"`: can carry `battery_field` and fault triggers.
-  * `"mode_observer"`: used by mode observer (e.g. `/cmd_vel/collision_smoothed`).
   * `"collision_nav"`: nav velocity command.
   * `"collision_output"`: collision-limited velocity command.
 
@@ -404,7 +377,7 @@ Per-topic:
   * `trigger_intervention(...)` is called and:
 
     * `operation_mode == "Autonomous"`, or
-    * `force_count=True` (for explicit/observed manual overrides).
+    * `force_count=True` (used by explicit `Manual_override` transitions on the `control_mode` topic).
 
 * E-stop, faults, joy overrides, etc. in **Manual** mode:
 
@@ -448,8 +421,6 @@ def generate_launch_description():
             'enable_remote_logging': LaunchConfiguration('enable_remote_logging'),
             'min_distance_threshold': LaunchConfiguration('min_distance_threshold'),
             'stop_timeout': LaunchConfiguration('stop_timeout'),
-            'mode_observer_cmd_timeout': LaunchConfiguration('mode_observer_cmd_timeout'),
-            'mode_observer_speed_threshold': LaunchConfiguration('mode_observer_speed_threshold'),
             'collision_nav_threshold': LaunchConfiguration('collision_nav_threshold'),
             'collision_zero_threshold': LaunchConfiguration('collision_zero_threshold'),
             'collision_time_window': LaunchConfiguration('collision_time_window'),
@@ -485,8 +456,6 @@ ros2 launch autonomy_metrics_logger autonomy_metrics_logger.launch.py \
   remote_mongodb_port:=27017 \
   min_distance_threshold:=0.1 \
   stop_timeout:=1.5 \
-  mode_observer_cmd_timeout:=0.8 \
-  mode_observer_speed_threshold:=0.02 \
   collision_nav_threshold:=0.02 \
   collision_zero_threshold:=0.001 \
   collision_time_window:=0.4
