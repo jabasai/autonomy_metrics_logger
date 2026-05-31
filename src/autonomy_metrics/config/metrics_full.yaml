@@ -58,9 +58,10 @@ topics:
         event_type: "Fault_shutdown"
 
   # ---------------------------------------------------------
-  # [MISSING] Control Mode (REQUIRED FOR MDBI)
+  # Control Mode (REQUIRED FOR MDBI)
   # ---------------------------------------------------------
-  # You must add this so the logger knows when to count 'autonomous' distance.
+  # The logger relies exclusively on this topic to know when the robot is in
+  # autonomous vs manual mode. There is no velocity-based fallback any more.
   # Adjust 'name' and 'mode_mapping' to match your robot.
   # - name: "/gophar/operation_mode"   # <--- CHECK THIS TOPIC NAME
   #   type: "std_msgs/msg/String"      # <--- CHECK THIS TYPE (String, Int8, etc)
@@ -72,16 +73,6 @@ topics:
   #     "MANUAL": "Manual"
   #     "1": "Autonomous"
   #     "0": "Manual"
-
-  # ---------------------------------------------------------
-  # Mode observation via velocity command
-  # ---------------------------------------------------------
-  # Rule: the heuristic will only be used if there is no topic with role: "control_mode" configured in the YAML.
-  - name: "/cmd_vel/collision_smoothed"
-    type: "geometry_msgs/msg/Twist"
-    role: "mode_observer"
-    log_fields: []     # keep empty if you don't want per-message events
-
 
   # ---------------------------------------------------------
   # Joystick command -> Intervention trigger on activity
