@@ -62,6 +62,31 @@ def generate_launch_description():
         description='Timeout (s) after last odom movement before speed is forced to 0',
     )
 
+    # DB resilience / cadence
+    db_metrics_period_arg = DeclareLaunchArgument(
+        'db_metrics_period',
+        default_value='1.0',
+        description='Period (s) between periodic distance-and-metrics writes to MongoDB',
+    )
+
+    db_server_selection_timeout_ms_arg = DeclareLaunchArgument(
+        'db_server_selection_timeout_ms',
+        default_value='1000',
+        description='MongoDB server-selection timeout (ms) - keeps DB ops from hanging',
+    )
+
+    db_connect_timeout_ms_arg = DeclareLaunchArgument(
+        'db_connect_timeout_ms',
+        default_value='1000',
+        description='MongoDB connect timeout (ms)',
+    )
+
+    db_socket_timeout_ms_arg = DeclareLaunchArgument(
+        'db_socket_timeout_ms',
+        default_value='2000',
+        description='MongoDB socket timeout (ms)',
+    )
+
     # Collision monitor (nav vs collision output)
     collision_nav_threshold_arg = DeclareLaunchArgument(
         'collision_nav_threshold',
@@ -99,6 +124,11 @@ def generate_launch_description():
     min_distance_threshold = LaunchConfiguration('min_distance_threshold')
     stop_timeout = LaunchConfiguration('stop_timeout')
 
+    db_metrics_period = LaunchConfiguration('db_metrics_period')
+    db_server_selection_timeout_ms = LaunchConfiguration('db_server_selection_timeout_ms')
+    db_connect_timeout_ms = LaunchConfiguration('db_connect_timeout_ms')
+    db_socket_timeout_ms = LaunchConfiguration('db_socket_timeout_ms')
+
     collision_nav_threshold = LaunchConfiguration('collision_nav_threshold')
     collision_zero_threshold = LaunchConfiguration('collision_zero_threshold')
     collision_time_window = LaunchConfiguration('collision_time_window')
@@ -122,6 +152,11 @@ def generate_launch_description():
             'min_distance_threshold': min_distance_threshold,
             'stop_timeout': stop_timeout,
 
+            'db_metrics_period': db_metrics_period,
+            'db_server_selection_timeout_ms': db_server_selection_timeout_ms,
+            'db_connect_timeout_ms': db_connect_timeout_ms,
+            'db_socket_timeout_ms': db_socket_timeout_ms,
+
             'collision_nav_threshold': collision_nav_threshold,
             'collision_zero_threshold': collision_zero_threshold,
             'collision_time_window': collision_time_window,
@@ -138,6 +173,10 @@ def generate_launch_description():
         enable_remote_logging_arg,
         min_distance_threshold_arg,
         stop_timeout_arg,
+        db_metrics_period_arg,
+        db_server_selection_timeout_ms_arg,
+        db_connect_timeout_ms_arg,
+        db_socket_timeout_ms_arg,
         collision_nav_threshold_arg,
         collision_zero_threshold_arg,
         collision_time_window_arg,
