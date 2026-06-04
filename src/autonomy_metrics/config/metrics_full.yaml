@@ -58,30 +58,35 @@ topics:
         event_type: "Fault_shutdown"
 
   # ---------------------------------------------------------
-  # [MISSING] Control Mode (REQUIRED FOR MDBI)
+  # Operation Mode (REQUIRED FOR MDBI)
   # ---------------------------------------------------------
-  # You must add this so the logger knows when to count 'autonomous' distance.
-  # Adjust 'name' and 'mode_mapping' to match your robot.
-  # - name: "/gophar/operation_mode"   # <--- CHECK THIS TOPIC NAME
-  #   type: "std_msgs/msg/String"      # <--- CHECK THIS TYPE (String, Int8, etc)
+  # std_msgs/msg/Bool: true => Autonomous, false => Manual.
+  # The logger uses this topic to attribute travelled distance to the right
+  # mode (autonomous vs manual). Auto -> Manual transitions are the ONLY
+  # source of MDBI incidents.
+  - name: "/autonomous_mode"
+    type: "std_msgs/msg/Bool"
+    role: "autonomous_mode"
+
+  # ---------------------------------------------------------
+  # Robot State (logged on every change; not counted for MDBI)
+  # ---------------------------------------------------------
+  # std_msgs/msg/String: expected values "disabled" / "enabled" / "active".
+  - name: "/robot_state"
+    type: "std_msgs/msg/String"
+    role: "robot_state"
+
+  # Legacy alternative (kept for backward-compat). Use ONE of /autonomous_mode
+  # OR a control_mode topic, not both.
+  # - name: "/gophar/operation_mode"
+  #   type: "std_msgs/msg/String"
   #   role: "control_mode"
-  #   mode_field: "data"               # The field inside the message holding the mode
-  #   # Map the values your robot sends to 'Autonomous' or 'Manual'
+  #   mode_field: "data"
   #   mode_mapping:
   #     "AUTO": "Autonomous"
   #     "MANUAL": "Manual"
   #     "1": "Autonomous"
   #     "0": "Manual"
-
-  # ---------------------------------------------------------
-  # Mode observation via velocity command
-  # ---------------------------------------------------------
-  # Rule: the heuristic will only be used if there is no topic with role: "control_mode" configured in the YAML.
-  - name: "/cmd_vel/collision_smoothed"
-    type: "geometry_msgs/msg/Twist"
-    role: "mode_observer"
-    log_fields: []     # keep empty if you don't want per-message events
-
 
   # ---------------------------------------------------------
   # Joystick command -> Intervention trigger on activity
