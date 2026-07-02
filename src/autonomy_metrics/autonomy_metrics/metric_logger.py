@@ -279,15 +279,11 @@ class AutonomyMetricsLogger(Node):
         # ------------------------------------------------------------------
         self._session_env = {
             'robot_name': os.getenv('ROBOT_NAME', 'UNDEFINED'),
-            'farm_name': os.getenv('FARM_NAME', 'UNDEFINED'),
-            'field_name': os.getenv('FIELD_NAME', 'UNDEFINED'),
-            'application': os.getenv('APPLICATION', 'UNDEFINED'),
-            'scenario_name': os.getenv('SCENARIO_NAME', 'UNDEFINED'),
+            'farm_name': os.getenv('JABAS_SITE', 'UNDEFINED'),
         }
         self.get_logger().info(
             f"Session env: robot={self._session_env['robot_name']}, "
-            f"farm={self._session_env['farm_name']}, field={self._session_env['field_name']}, "
-            f"app={self._session_env['application']}, scenario={self._session_env['scenario_name']}"
+            f"farm={self._session_env['farm_name']}, "
         )
 
         self._session_git_repos = self._collect_git_repos_info()

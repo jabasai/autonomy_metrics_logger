@@ -123,10 +123,7 @@ The node creates one document in `robot_incidents.sessions` per run:
 Environment variables used to tag the session:
 
 - `ROBOT_NAME`
-- `FARM_NAME`
-- `FIELD_NAME`
-- `APPLICATION`
-- `SCENARIO_NAME`
+- `JABAS_SITE`
 
 ---
 
