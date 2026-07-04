@@ -11,7 +11,7 @@
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
-<!--   <exec_depend>hunter-base</exec_depend> -->
+  <exec_depend>python3-pymongo</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>
