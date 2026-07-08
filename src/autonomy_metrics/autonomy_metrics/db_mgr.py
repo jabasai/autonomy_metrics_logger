@@ -97,7 +97,7 @@ class DatabaseMgr:
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
-    def init_session(self, env_variables, aoc_repos_info):
+    def init_session(self, env_variables):
         """
         Insert the session document. Idempotent: a no-op once session_id is set.
         Raises pymongo errors on failure; caller must handle.
@@ -113,7 +113,6 @@ class DatabaseMgr:
             "field_name": env_variables.get('field_name'),
             "application": env_variables.get('application'),
             "scenario_name": env_variables.get('scenario_name'),
-            "aoc_repos_info": aoc_repos_info,
             "mdbi": None,
             "incidents": 0,
             "distance": 0,

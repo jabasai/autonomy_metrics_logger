@@ -1,18 +1,3 @@
-git_repos:
-  # all repos are with reference to /home/ros/aoc_strawberry_scenario_ws/src/aoc_strawberry_scenario
-  scenario: "."
-  autonomy_metrics_logger: "jabas/autonomy_metrics_logger"
-  navfn_planner: "jabas/navfn_planner"
-  perception_boundary_estimator: "jabas/perception_boundary_estimator"
-  pointcloud_processing: "jabas/pointcloud_processing"
-  robot_boundary_checker: "jabas/robot_boundary_checker"
-  ros2_topic_monitor: "jabas/ros2_topic_monitor"
-  row_nav_planner: "jabas/row_nav_planner"
-  ppl_gofar_platform: "robots/ppl_gofar_platform"
-  topological_navigation: "contrib/topological_navigation"
-  sentor: "contrib/sentor"
-  kiss-icp: "contrib/kiss-icp"
-
 topics:
   # ---------------------------------------------------------
   # GPS

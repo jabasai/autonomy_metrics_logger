@@ -6,11 +6,11 @@ Author: Ibrahim Hroob - JABASAI
 
 import os
 import math
-import subprocess
 import yaml
 from datetime import datetime, timezone
 from importlib import import_module
 
+from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import (
@@ -121,13 +121,22 @@ class AutonomyMetricsLogger(Node):
 
         self.get_logger().info("Starting YAML-driven AutonomyMetricsLogger")
 
+        package_name = 'autonomy_metrics'
+        try:
+            pkg_share = get_package_share_directory(package_name)
+            default_config_yaml = os.path.join(pkg_share, 'config', 'metrics_full.yaml')
+        except PackageNotFoundError:
+            # Fallback for source-tree runs where package index is unavailable.
+            default_config_yaml = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), '..', 'config', 'metrics_full.yaml')
+            )
+
         # ------------------------------------------------------------------
         # Parameters
         # ------------------------------------------------------------------
         self.declare_parameter(
             'config_yaml',
-            '/home/ros/aoc_strawberry_scenario_ws/src/aoc_strawberry_scenario/'
-            'jabas/autonomy_metrics_logger/src/autonomy_metrics/config/metrics_full.yaml',
+            default_config_yaml,
         )
         self.declare_parameter('mongodb_host', 'localhost')
         self.declare_parameter('mongodb_port', 27018)
@@ -221,9 +230,8 @@ class AutonomyMetricsLogger(Node):
         self.dynamic_publishers = {}
         self.topic_cfg_map = {}
 
-        # Cached env + git info, used to retry init_session if Mongo was down at start
+        # Cached env, used to retry init_session if Mongo was down at start
         self._session_env = None
-        self._session_git_repos = None
 
         # DB health tracking ------------------------------------------------
         # Per-DB status; reason holds the latest error message (or empty)
@@ -275,7 +283,7 @@ class AutonomyMetricsLogger(Node):
         self.load_and_setup_config()
 
         # ------------------------------------------------------------------
-        # Session metadata (env + git info) — try init now, retry on watchdog
+        # Session metadata — try init now, retry on watchdog
         # ------------------------------------------------------------------
         self._session_env = {
             'robot_name': os.getenv('ROBOT_NAME', 'UNDEFINED'),
@@ -286,7 +294,6 @@ class AutonomyMetricsLogger(Node):
             f"farm={self._session_env['farm_name']}, "
         )
 
-        self._session_git_repos = self._collect_git_repos_info()
         self._try_init_sessions()  # best effort; will retry on watchdog
 
         # ------------------------------------------------------------------
@@ -403,7 +410,7 @@ class AutonomyMetricsLogger(Node):
         if self.db_mgr_local is not None and self.db_mgr_local.session_id is None:
             self._safe_db_call(
                 'local', self.db_mgr_local.init_session,
-                self._session_env, self._session_git_repos or [],
+                self._session_env,
             )
 
         if (
@@ -412,28 +419,8 @@ class AutonomyMetricsLogger(Node):
         ):
             self._safe_db_call(
                 'remote', self.db_mgr_remote.init_session,
-                self._session_env, self._session_git_repos or [],
+                self._session_env,
             )
-
-    def _collect_git_repos_info(self):
-        repos = []
-        if not self.config:
-            return repos
-        try:
-            git_cfg = self.config.get('git_repos', {})
-            for label, p in git_cfg.items():
-                repo_path = os.path.join(
-                    '/home/ros/aoc_strawberry_scenario_ws/src/aoc_strawberry_scenario', p
-                )
-                repo_info = self.get_git_info(repo_path)
-                repos.append({label: repo_info})
-                self.get_logger().debug(
-                    f"Git repo [{label}]: path={repo_info['path']}, "
-                    f"branch={repo_info['branch']}, short_commit={repo_info['short_commit']}"
-                )
-        except Exception as e:
-            self.get_logger().warn(f"Failed to collect git info: {e}")
-        return repos
 
     # ----------------------------------------------------------------------
     # YAML config loading
@@ -1115,78 +1102,6 @@ class AutonomyMetricsLogger(Node):
         msg = Float32()
         msg.data = float(speed)
         self.speed_publisher.publish(msg)
-
-    # ----------------------------------------------------------------------
-    # Git info
-    # ----------------------------------------------------------------------
-    def get_git_info(self, repo_path):
-        info = {
-            "path": repo_path,
-            "exists": False,
-            "remote": None,
-            "branch": None,
-            "commit": None,
-            "short_commit": None,
-            "commit_message": None,
-            "tags": [],
-            "describe": None,
-            "dirty": None,
-            "error": None,
-        }
-
-        try:
-            if not repo_path or not os.path.isdir(repo_path):
-                info["error"] = "Path does not exist or is not a directory"
-                return info
-
-            def git(args):
-                result = subprocess.run(
-                    ["git", "-C", repo_path] + args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(result.stderr.strip())
-                return result.stdout.strip()
-
-            info["exists"] = True
-
-            try: info["remote"] = git(["config", "--get", "remote.origin.url"])
-            except Exception: info["remote"] = None
-
-            try: info["branch"] = git(["rev-parse", "--abbrev-ref", "HEAD"])
-            except Exception: info["branch"] = None
-
-            try: info["commit"] = git(["rev-parse", "HEAD"])
-            except Exception: info["commit"] = None
-
-            try: info["short_commit"] = git(["rev-parse", "--short", "HEAD"])
-            except Exception: info["short_commit"] = None
-
-            try: info["commit_message"] = git(["log", "-1", "--pretty=%s"])
-            except Exception: info["commit_message"] = None
-
-            try:
-                tags_str = git(["tag", "--points-at", "HEAD"])
-                info["tags"] = tags_str.splitlines() if tags_str else []
-            except Exception:
-                info["tags"] = []
-
-            try: info["describe"] = git(["describe", "--tags", "--always"])
-            except Exception: info["describe"] = None
-
-            try:
-                status = git(["status", "--porcelain"])
-                info["dirty"] = bool(status)
-            except Exception:
-                info["dirty"] = None
-
-        except Exception as e:
-            info["error"] = str(e)
-
-        return info
-
 
 def main(args=None):
     rclpy.init(args=args)
