@@ -119,6 +119,8 @@ class DatabaseMgr:
             "autonomous_distance": 0,
             "manual_distance": 0,
             "collision_incidents": 0,
+            "battery_percentage": None,
+            "battery_history": [],
             "events": [],
         }
 
@@ -171,3 +173,16 @@ class DatabaseMgr:
 
     def update_collision_incidents(self, collision_incidents):
         return self._set_field("collision_incidents", collision_incidents)
+
+    def update_battery(self, battery_percentage):
+        return self._set_field("battery_percentage", battery_percentage)
+
+    def add_battery_sample(self, sample):
+        """Append a timestamped battery reading to the session's history."""
+        self._require_session()
+        sample = self._bson_safe(sample)
+        result = self.sessions_collection.update_one(
+            {"_id": ObjectId(self.session_id)},
+            {"$push": {"battery_history": sample}},
+        )
+        return result.modified_count > 0
