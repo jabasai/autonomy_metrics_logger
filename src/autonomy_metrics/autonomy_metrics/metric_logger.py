@@ -5,6 +5,7 @@ Author: Ibrahim Hroob - JABASAI
 """
 
 import os
+import json
 import math
 import yaml
 from datetime import datetime, timezone
@@ -146,17 +147,31 @@ class AutonomyMetricsLogger(Node):
         self.declare_parameter('min_distance_threshold', 0.2)
         self.declare_parameter('stop_timeout', 2.0)
 
+        # Odometry sanity limits: reject localisation jumps / EKF resets so a
+        # single teleporting pose cannot inflate billable distance.
+        self.declare_parameter('max_odom_step_distance', 2.5)   # m per accepted step
+        self.declare_parameter('max_odom_gap', 5.0)             # s without odom -> re-anchor
+
+        # Battery sampling: the timer only rate-limits; a sample is written
+        # only when the level actually changes.
+        self.declare_parameter('battery_log_period', 60.0)
+        self.declare_parameter('battery_change_threshold', 0.5)
+
         # DB resilience / cadence
         self.declare_parameter('db_metrics_period', 1.0)            # s, periodic save of metrics
         self.declare_parameter('db_server_selection_timeout_ms', 1000)
         self.declare_parameter('db_connect_timeout_ms', 1000)
         self.declare_parameter('db_socket_timeout_ms', 2000)
 
-        # Collision detection tuning
+        # Collision detection tuning (legacy cmd_vel comparison)
         self.declare_parameter('collision_nav_threshold', 0.01)
         self.declare_parameter('collision_zero_threshold', 0.001)
         self.declare_parameter('collision_time_window', 0.5)
         self.declare_parameter('collision_log_cooldown', 1.0)
+
+        # Collision detection tuning (nav2 collision_detector state)
+        self.declare_parameter('collision_detector_min_duration', 0.0)
+        self.declare_parameter('collision_detector_clear_time', 1.0)
 
         # Read parameters
         self.collision_nav_threshold = self.get_parameter('collision_nav_threshold').get_parameter_value().double_value
@@ -171,6 +186,12 @@ class AutonomyMetricsLogger(Node):
         self.enable_remote_logging = self.get_parameter('enable_remote_logging').get_parameter_value().bool_value
         self.min_distance_threshold = self.get_parameter('min_distance_threshold').get_parameter_value().double_value
         self.stop_timeout = self.get_parameter('stop_timeout').get_parameter_value().double_value
+        self.max_odom_step_distance = self.get_parameter('max_odom_step_distance').get_parameter_value().double_value
+        self.max_odom_gap = self.get_parameter('max_odom_gap').get_parameter_value().double_value
+        self.battery_log_period = self.get_parameter('battery_log_period').get_parameter_value().double_value
+        self.battery_change_threshold = self.get_parameter('battery_change_threshold').get_parameter_value().double_value
+        self.collision_detector_min_duration = self.get_parameter('collision_detector_min_duration').get_parameter_value().double_value
+        self.collision_detector_clear_time = self.get_parameter('collision_detector_clear_time').get_parameter_value().double_value
         self.db_metrics_period = self.get_parameter('db_metrics_period').get_parameter_value().double_value
         self.db_server_selection_timeout_ms = self.get_parameter('db_server_selection_timeout_ms').get_parameter_value().integer_value
         self.db_connect_timeout_ms = self.get_parameter('db_connect_timeout_ms').get_parameter_value().integer_value
@@ -213,17 +234,32 @@ class AutonomyMetricsLogger(Node):
         self.last_collision_time = None
         self.last_collision_logged_time = None
 
+        # Collision monitoring via nav2 collision_detector state
+        self.collision_detector_active = False       # latched "currently in detection"
+        self.collision_detector_since = None         # first time detections went True
+        self.collision_detector_clear_since = None   # first time detections went False
+        self.collision_detector_counted = False      # incident already counted for this episode
+
         # System snapshot + change tracking
         self.system_snapshot = {}
         self.prev_field_values = {}
         self.current_battery = None
+        self.last_battery_log_time = None
+        self.last_logged_battery = None
+
+        # Sentor channel heartbeats: channel -> bool
+        self.sentor_channels = {}
+        self.sentor_active_failures = None
 
         # Odometry / Speed state
         self.previous_x = None
         self.previous_y = None
+        self.previous_time = None
         self.init_pose = True
         self.speed = 0.0
+        self.rejected_odom_steps = 0
         self.last_odom_update_time = self.get_clock().now()
+        self.last_odom_msg_time = self.get_clock().now()
 
         # Subscriptions / publishers / per-topic config
         self.dynamic_subs = []
@@ -255,6 +291,7 @@ class AutonomyMetricsLogger(Node):
         self.collision_incidents_publisher = self.create_publisher(
             Int32, 'mdbi_logger/total_collision_incidents', 10
         )
+        self.battery_publisher = self.create_publisher(Float32, 'mdbi_logger/battery_percentage', 10)
 
         # Latched health
         self.db_health_publisher = self.create_publisher(Bool, 'mdbi_logger/db_health', LATCHED_QOS)
@@ -305,6 +342,13 @@ class AutonomyMetricsLogger(Node):
         period = max(0.1, float(self.db_metrics_period))
         self.db_metrics_timer = self.create_timer(period, self.db_metrics_tick)
         self.get_logger().info(f"DB metrics save period: {period:.2f}s")
+
+        battery_period = max(1.0, float(self.battery_log_period))
+        self.battery_timer = self.create_timer(battery_period, self.battery_tick)
+        self.get_logger().info(
+            f"Battery check period: {battery_period:.2f}s "
+            f"(logged only on change >= {self.battery_change_threshold}%)"
+        )
 
     # ----------------------------------------------------------------------
     # DB construction / health
@@ -482,8 +526,25 @@ class AutonomyMetricsLogger(Node):
                     'robot_state',
                     'control_mode',
                     'estop',
+                    'collision_detector',
+                    'sentor_channel',
                 }
-                qos = STATE_QOS if role in state_roles else qos_profile_sensor_data
+                if role in state_roles:
+                    qos = STATE_QOS
+                elif role == 'sentor_failures':
+                    qos = LATCHED_QOS
+                else:
+                    qos = qos_profile_sensor_data
+
+                # Per-topic override, needed for latched publishers whose value
+                # may have been sent before this node started.
+                qos_override = str(item.get('qos', '')).lower()
+                if qos_override == 'latched':
+                    qos = LATCHED_QOS
+                elif qos_override == 'reliable':
+                    qos = STATE_QOS
+                elif qos_override == 'sensor_data':
+                    qos = qos_profile_sensor_data
 
                 if role == 'odometry':
                     cb = lambda msg, n=name: self.odom_role_callback(n, msg)
@@ -499,13 +560,25 @@ class AutonomyMetricsLogger(Node):
                     cb = lambda msg, n=name: self.collision_nav_callback(n, msg)
                 elif role == 'collision_output':
                     cb = lambda msg, n=name: self.collision_output_callback(n, msg)
+                elif role == 'collision_detector':
+                    cb = lambda msg, n=name: self.collision_detector_callback(n, msg)
+                elif role == 'sentor_channel':
+                    cb = lambda msg, n=name: self.sentor_channel_callback(n, msg)
+                elif role == 'sentor_failures':
+                    cb = lambda msg, n=name: self.sentor_failures_callback(n, msg)
                 else:
                     lf = item.get('log_fields', [])
                     cb = lambda msg, n=name, l=lf: self.generic_callback(n, msg, l)
 
                 self.create_subscription(msg_cls, name, cb, qos)
+                if qos is STATE_QOS:
+                    qos_label = 'RELIABLE'
+                elif qos is LATCHED_QOS:
+                    qos_label = 'LATCHED'
+                else:
+                    qos_label = 'sensor_data'
                 self.get_logger().info(
-                    f"Subscribed to {name} (role={role or 'generic'}, qos={'RELIABLE' if qos is STATE_QOS else 'sensor_data'})"
+                    f"Subscribed to {name} (role={role or 'generic'}, qos={qos_label})"
                 )
 
             except Exception as e:
@@ -613,15 +686,30 @@ class AutonomyMetricsLogger(Node):
 
         current_time = self.get_clock().now()
 
+        # Reject non-finite poses outright; they would poison the anchor.
+        if not (math.isfinite(pos.x) and math.isfinite(pos.y)):
+            self.get_logger().warn("[Odom] Non-finite pose received; ignoring sample")
+            return
+
         if self.init_pose:
-            self.init_pose = False
-            self.previous_x = pos.x
-            self.previous_y = pos.y
-            self.previous_time = current_time
-            self.last_odom_update_time = current_time
+            self._reset_odom_anchor(pos, current_time)
             self.get_logger().info(
                 f"[Odom] Initial pose set x={pos.x:.3f}, y={pos.y:.3f}"
             )
+            return
+
+        gap = (current_time - self.last_odom_msg_time).nanoseconds * 1e-9
+        self.last_odom_msg_time = current_time
+
+        # A long silence means we cannot trust the delta across the gap
+        # (odom source restarted, EKF reset, container hiccup): re-anchor.
+        if gap > self.max_odom_gap:
+            self.get_logger().warn(
+                f"[Odom] {gap:.2f}s without odometry (> {self.max_odom_gap}s); re-anchoring"
+            )
+            self._reset_odom_anchor(pos, current_time)
+            self.speed = 0.0
+            self.publish_speed(0.0)
             return
 
         dx = pos.x - self.previous_x
@@ -634,12 +722,21 @@ class AutonomyMetricsLogger(Node):
         if dist < self.min_distance_threshold:
             return
 
-        if not hasattr(self, 'previous_time'):
-            self.previous_time = current_time
-
         time_diff = (current_time - self.previous_time).nanoseconds * 1e-9
 
-        self.speed = dist / time_diff if time_diff > 0 else 0.0
+        # Localisation jump rejection: a teleport (GNSS re-fix, EKF reset,
+        # datum change) must never be billed as travelled distance. Re-anchor
+        # on the new pose and drop the step.
+        if dist > self.max_odom_step_distance:
+            self.rejected_odom_steps += 1
+            self.get_logger().warn(
+                f"[Odom] Rejected jump #{self.rejected_odom_steps}: "
+                f"step={dist:.3f}m over {time_diff:.3f}s; re-anchoring"
+            )
+            self._reset_odom_anchor(pos, current_time)
+            return
+
+        self.speed = dist / time_diff if time_diff > 0 else self.speed
         self.distance += dist
 
         if self.details.get('operation_mode') == self.AUTO:
@@ -647,10 +744,7 @@ class AutonomyMetricsLogger(Node):
         else:
             self.manual_distance += dist
 
-        self.previous_x = pos.x
-        self.previous_y = pos.y
-        self.previous_time = current_time
-        self.last_odom_update_time = current_time
+        self._reset_odom_anchor(pos, current_time)
 
         self.system_snapshot['metrics'] = {
             'distance': self.distance,
@@ -669,6 +763,14 @@ class AutonomyMetricsLogger(Node):
         self.publish_distance_topics()
         self.publish_speed(self.speed)
         self.handle_dynamic_publish(topic_name, msg)
+
+    def _reset_odom_anchor(self, pos, stamp):
+        self.init_pose = False
+        self.previous_x = pos.x
+        self.previous_y = pos.y
+        self.previous_time = stamp
+        self.last_odom_update_time = stamp
+        self.last_odom_msg_time = stamp
 
     def autonomous_mode_role_callback(self, topic_name, msg):
         """
@@ -943,6 +1045,166 @@ class AutonomyMetricsLogger(Node):
         self.collision_prev_has_velocity = collision_has_velocity_now
 
     # ----------------------------------------------------------------------
+    # Collision detection via nav2_msgs/CollisionDetectorState
+    # ----------------------------------------------------------------------
+    def collision_detector_callback(self, topic_name, msg):
+        """
+        nav2_msgs/msg/CollisionDetectorState: ``polygons`` (string[]) aligned
+        with ``detections`` (bool[]). One incident is counted per detection
+        *episode* (rising edge), not per message, so a sustained obstacle does
+        not inflate the count.
+        """
+        try:
+            detections = [bool(d) for d in msg.detections]
+            polygons = [str(p) for p in msg.polygons]
+        except Exception as e:
+            self.get_logger().warn(f"[CollisionDetector] malformed message on {topic_name}: {e}")
+            return
+
+        triggered = [
+            polygons[i] if i < len(polygons) else f"polygon_{i}"
+            for i, d in enumerate(detections)
+            if d
+        ]
+        any_detection = bool(triggered)
+        now = self.get_clock().now()
+
+        self.system_snapshot['collision_detector'] = {
+            'polygons': polygons,
+            'detections': detections,
+            'triggered': triggered,
+        }
+
+        if any_detection:
+            self.collision_detector_clear_since = None
+            if self.collision_detector_since is None:
+                self.collision_detector_since = now
+
+            held = (now - self.collision_detector_since).nanoseconds * 1e-9
+            if not self.collision_detector_counted and held >= self.collision_detector_min_duration:
+                self.collision_detector_counted = True
+                self.collision_detector_active = True
+                self.collision_incidents += 1
+                self.get_logger().info(
+                    f"[CollisionDetector] incident #{self.collision_incidents} "
+                    f"polygons={triggered}"
+                )
+                self.log_collision_event(
+                    source=topic_name,
+                    detector={'polygons': polygons, 'detections': detections, 'triggered': triggered},
+                )
+            return
+
+        # No detection: require the zone to stay clear for `clear_time` before
+        # re-arming, so a flickering sensor cannot produce duplicate incidents.
+        if not self.collision_detector_active and self.collision_detector_since is None:
+            return
+
+        if self.collision_detector_clear_since is None:
+            self.collision_detector_clear_since = now
+            return
+
+        cleared_for = (now - self.collision_detector_clear_since).nanoseconds * 1e-9
+        if cleared_for < self.collision_detector_clear_time:
+            return
+
+        if self.collision_detector_active:
+            self.get_logger().info("[CollisionDetector] zone cleared")
+            self.log_event('Collision_cleared', {
+                **self.details,
+                'topic': topic_name,
+                'system_snapshot': self.system_snapshot.copy(),
+            })
+
+        self.collision_detector_active = False
+        self.collision_detector_counted = False
+        self.collision_detector_since = None
+        self.collision_detector_clear_since = None
+
+    # ----------------------------------------------------------------------
+    # Sentor integration
+    # ----------------------------------------------------------------------
+    def sentor_channel_callback(self, topic_name, msg):
+        """
+        std_msgs/Bool on ``/<channel>/heartbeat``. True while every monitor
+        contributing to the channel is healthy. Logs an event on each
+        transition; optionally counts a failure as an MDBI incident when
+        ``count_incident: true`` is set on the topic entry.
+        """
+        cfg = self.topic_cfg_map.get(topic_name, {})
+        channel = cfg.get('channel', topic_name.strip('/').split('/')[0])
+
+        try:
+            alive = bool(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f"[sentor_channel] could not read .data on {topic_name}: {e}")
+            return
+
+        prev = self.sentor_channels.get(channel)
+        self.sentor_channels[channel] = alive
+        self.system_snapshot['sentor_channels'] = dict(self.sentor_channels)
+
+        if prev is None or prev == alive:
+            return
+
+        extra = {
+            'topic': topic_name,
+            'channel': channel,
+            'prev_value': prev,
+            'new_value': alive,
+            'active_failures': self.sentor_active_failures,
+        }
+
+        if alive:
+            self.get_logger().info(f"[sentor_channel] '{channel}' recovered")
+            self.log_event('Sentor_channel_recovered', {
+                **self.details,
+                **extra,
+                'system_snapshot': self.system_snapshot.copy(),
+            })
+            return
+
+        self.get_logger().warn(f"[sentor_channel] '{channel}' failed")
+        if cfg.get('count_incident', False):
+            self.trigger_intervention(
+                cfg.get('event_type', f'Sentor_channel_failed_{channel}'),
+                extra=extra,
+            )
+        else:
+            self.log_event(cfg.get('event_type', 'Sentor_channel_failed'), {
+                **self.details,
+                **extra,
+                'system_snapshot': self.system_snapshot.copy(),
+            })
+
+    def sentor_failures_callback(self, topic_name, msg):
+        """
+        std_msgs/String on ``/sentor/active_failures``: a latched JSON array of
+        enriched failure entries. Logged whenever the failure set changes.
+        """
+        try:
+            failures = json.loads(msg.data) if msg.data else []
+        except Exception as e:
+            self.get_logger().warn(f"[sentor_failures] invalid JSON on {topic_name}: {e}")
+            return
+
+        if failures == self.sentor_active_failures:
+            return
+
+        prev = self.sentor_active_failures
+        self.sentor_active_failures = failures
+        self.system_snapshot['sentor_active_failures'] = failures
+
+        self.get_logger().info(f"[sentor_failures] {len(failures)} active failure(s)")
+        self.log_event('Sentor_failures_changed', {
+            **self.details,
+            'topic': topic_name,
+            'active_failures': failures,
+            'prev_failures': prev,
+            'system_snapshot': self.system_snapshot.copy(),
+        })
+
+    # ----------------------------------------------------------------------
     # Timers
     # ----------------------------------------------------------------------
     def timer_callback(self):
@@ -1020,6 +1282,41 @@ class AutonomyMetricsLogger(Node):
             self._safe_db_call(label, dbm.update_incidents, self.incidents)
             self._safe_db_call(label, dbm.update_mdbi, mdbi_val)
             self._safe_db_call(label, dbm.update_collision_incidents, self.collision_incidents)
+            if self.current_battery is not None:
+                self._safe_db_call(label, dbm.update_battery, float(self.current_battery))
+
+    def battery_tick(self):
+        """Append a timestamped battery sample, but only when the level changed."""
+        if self.current_battery is None:
+            return
+
+        level = float(self.current_battery)
+
+        if (
+            self.last_logged_battery is not None
+            and abs(level - self.last_logged_battery) < self.battery_change_threshold
+        ):
+            return
+
+        self.last_logged_battery = level
+
+        sample = {
+            'time': datetime.now(tz=timezone.utc),
+            'battery_percentage': level,
+            'distance': float(self.distance),
+            'autonomous_distance': float(self.autonomous_distance),
+            'operation_mode': self.details.get('operation_mode'),
+            'robot_state': self.details.get('robot_state'),
+        }
+
+        for label, dbm in (('local', self.db_mgr_local), ('remote', self.db_mgr_remote)):
+            if dbm is None or dbm.session_id is None:
+                continue
+            self._safe_db_call(label, dbm.add_battery_sample, sample)
+
+        bmsg = Float32()
+        bmsg.data = level
+        self.battery_publisher.publish(bmsg)
 
     def log_event(self, msg='', details=None):
         if details is None:
@@ -1051,28 +1348,38 @@ class AutonomyMetricsLogger(Node):
         # exact state at the moment the event happened.
         self.update_db_metrics()
 
-    def log_collision_event(self):
+    def log_collision_event(self, source='cmd_vel', detector=None):
         details = {
             "collision_incident_index": self.collision_incidents,
             "incidents": self.incidents,
             "collision_incidents": self.collision_incidents,
             "total_incidents": self.incidents + self.collision_incidents,
-            "nav_cmd": {
+            "source": source,
+            "operation_mode": self.details.get('operation_mode'),
+            "robot_state": self.details.get('robot_state'),
+            "system_snapshot": self.system_snapshot.copy(),
+        }
+
+        if detector is not None:
+            details["collision_detector"] = detector
+
+        if self.last_nav_cmd is not None:
+            details["nav_cmd"] = {
                 "linear": {
                     "x": float(self.last_nav_cmd.linear.x),
                     "y": float(self.last_nav_cmd.linear.y),
                 },
                 "angular": {"z": float(self.last_nav_cmd.angular.z)},
-            },
-            "collision_cmd": {
+            }
+
+        if self.last_collision_cmd is not None:
+            details["collision_cmd"] = {
                 "linear": {
                     "x": float(self.last_collision_cmd.linear.x),
                     "y": float(self.last_collision_cmd.linear.y),
                 },
                 "angular": {"z": float(self.last_collision_cmd.angular.z)},
-            },
-            "system_snapshot": self.system_snapshot.copy(),
-        }
+            }
 
         self.get_logger().info(
             f"[Collision] Logging collision event #{self.collision_incidents} "

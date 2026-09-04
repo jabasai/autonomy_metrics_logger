@@ -112,6 +112,44 @@ def generate_launch_description():
         description='Cooldown (s) between consecutive collision logs (if you still use cooldown)',
     )
 
+    # Collision monitor (nav2 collision_detector state)
+    collision_detector_min_duration_arg = DeclareLaunchArgument(
+        'collision_detector_min_duration',
+        default_value='0.0',
+        description='Minimum time (s) a detection must persist before an incident is counted',
+    )
+
+    collision_detector_clear_time_arg = DeclareLaunchArgument(
+        'collision_detector_clear_time',
+        default_value='1.0',
+        description='Time (s) all zones must stay clear before a new incident can be counted',
+    )
+
+    # Odometry robustness
+    max_odom_step_distance_arg = DeclareLaunchArgument(
+        'max_odom_step_distance',
+        default_value='2.5',
+        description='Max accepted distance (m) between odom samples; larger steps are treated as jumps',
+    )
+
+    max_odom_gap_arg = DeclareLaunchArgument(
+        'max_odom_gap',
+        default_value='5.0',
+        description='Odometry silence (s) after which the pose anchor is reset instead of integrated',
+    )
+
+    battery_log_period_arg = DeclareLaunchArgument(
+        'battery_log_period',
+        default_value='60.0',
+        description='Period (s) at which the battery level is checked for a change',
+    )
+
+    battery_change_threshold_arg = DeclareLaunchArgument(
+        'battery_change_threshold',
+        default_value='0.5',
+        description='Minimum battery change (%) required to write a new history sample',
+    )
+
     # -------------------------------------------------------------------------
     # LaunchConfigurations (bind arguments to parameters)
     # -------------------------------------------------------------------------
@@ -133,6 +171,13 @@ def generate_launch_description():
     collision_zero_threshold = LaunchConfiguration('collision_zero_threshold')
     collision_time_window = LaunchConfiguration('collision_time_window')
     collision_log_cooldown = LaunchConfiguration('collision_log_cooldown')
+    collision_detector_min_duration = LaunchConfiguration('collision_detector_min_duration')
+    collision_detector_clear_time = LaunchConfiguration('collision_detector_clear_time')
+
+    max_odom_step_distance = LaunchConfiguration('max_odom_step_distance')
+    max_odom_gap = LaunchConfiguration('max_odom_gap')
+    battery_log_period = LaunchConfiguration('battery_log_period')
+    battery_change_threshold = LaunchConfiguration('battery_change_threshold')
 
     # -------------------------------------------------------------------------
     # AutonomyMetricsLogger node
@@ -161,6 +206,13 @@ def generate_launch_description():
             'collision_zero_threshold': collision_zero_threshold,
             'collision_time_window': collision_time_window,
             'collision_log_cooldown': collision_log_cooldown,
+            'collision_detector_min_duration': collision_detector_min_duration,
+            'collision_detector_clear_time': collision_detector_clear_time,
+
+            'max_odom_step_distance': max_odom_step_distance,
+            'max_odom_gap': max_odom_gap,
+            'battery_log_period': battery_log_period,
+            'battery_change_threshold': battery_change_threshold,
         }],
     )
 
@@ -181,5 +233,11 @@ def generate_launch_description():
         collision_zero_threshold_arg,
         collision_time_window_arg,
         collision_log_cooldown_arg,
+        collision_detector_min_duration_arg,
+        collision_detector_clear_time_arg,
+        max_odom_step_distance_arg,
+        max_odom_gap_arg,
+        battery_log_period_arg,
+        battery_change_threshold_arg,
         metrics_logger_node,
     ])
