@@ -125,17 +125,11 @@ def generate_launch_description():
         description='Time (s) all zones must stay clear before a new incident can be counted',
     )
 
-    # Odometry robustness (platform maximum velocity is 2.0 m/s)
+    # Odometry robustness
     max_odom_step_distance_arg = DeclareLaunchArgument(
         'max_odom_step_distance',
         default_value='2.5',
         description='Max accepted distance (m) between odom samples; larger steps are treated as jumps',
-    )
-
-    max_odom_speed_arg = DeclareLaunchArgument(
-        'max_odom_speed',
-        default_value='2.5',
-        description='Max implied speed (m/s) for an accepted odom step; faster steps are rejected',
     )
 
     max_odom_gap_arg = DeclareLaunchArgument(
@@ -181,7 +175,6 @@ def generate_launch_description():
     collision_detector_clear_time = LaunchConfiguration('collision_detector_clear_time')
 
     max_odom_step_distance = LaunchConfiguration('max_odom_step_distance')
-    max_odom_speed = LaunchConfiguration('max_odom_speed')
     max_odom_gap = LaunchConfiguration('max_odom_gap')
     battery_log_period = LaunchConfiguration('battery_log_period')
     battery_change_threshold = LaunchConfiguration('battery_change_threshold')
@@ -217,7 +210,6 @@ def generate_launch_description():
             'collision_detector_clear_time': collision_detector_clear_time,
 
             'max_odom_step_distance': max_odom_step_distance,
-            'max_odom_speed': max_odom_speed,
             'max_odom_gap': max_odom_gap,
             'battery_log_period': battery_log_period,
             'battery_change_threshold': battery_change_threshold,
@@ -244,7 +236,6 @@ def generate_launch_description():
         collision_detector_min_duration_arg,
         collision_detector_clear_time_arg,
         max_odom_step_distance_arg,
-        max_odom_speed_arg,
         max_odom_gap_arg,
         battery_log_period_arg,
         battery_change_threshold_arg,

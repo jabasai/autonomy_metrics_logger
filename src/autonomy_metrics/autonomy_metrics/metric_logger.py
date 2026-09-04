@@ -149,9 +149,7 @@ class AutonomyMetricsLogger(Node):
 
         # Odometry sanity limits: reject localisation jumps / EKF resets so a
         # single teleporting pose cannot inflate billable distance.
-        # Platform maximum velocity is 2.0 m/s; limits carry 25% margin.
         self.declare_parameter('max_odom_step_distance', 2.5)   # m per accepted step
-        self.declare_parameter('max_odom_speed', 2.5)           # m/s implied by a step
         self.declare_parameter('max_odom_gap', 5.0)             # s without odom -> re-anchor
 
         # Battery sampling: the timer only rate-limits; a sample is written
@@ -189,7 +187,6 @@ class AutonomyMetricsLogger(Node):
         self.min_distance_threshold = self.get_parameter('min_distance_threshold').get_parameter_value().double_value
         self.stop_timeout = self.get_parameter('stop_timeout').get_parameter_value().double_value
         self.max_odom_step_distance = self.get_parameter('max_odom_step_distance').get_parameter_value().double_value
-        self.max_odom_speed = self.get_parameter('max_odom_speed').get_parameter_value().double_value
         self.max_odom_gap = self.get_parameter('max_odom_gap').get_parameter_value().double_value
         self.battery_log_period = self.get_parameter('battery_log_period').get_parameter_value().double_value
         self.battery_change_threshold = self.get_parameter('battery_change_threshold').get_parameter_value().double_value
@@ -726,22 +723,20 @@ class AutonomyMetricsLogger(Node):
             return
 
         time_diff = (current_time - self.previous_time).nanoseconds * 1e-9
-        implied_speed = dist / time_diff if time_diff > 0 else float('inf')
 
         # Localisation jump rejection: a teleport (GNSS re-fix, EKF reset,
         # datum change) must never be billed as travelled distance. Re-anchor
         # on the new pose and drop the step.
-        if dist > self.max_odom_step_distance or implied_speed > self.max_odom_speed:
+        if dist > self.max_odom_step_distance:
             self.rejected_odom_steps += 1
             self.get_logger().warn(
                 f"[Odom] Rejected jump #{self.rejected_odom_steps}: "
-                f"step={dist:.3f}m over {time_diff:.3f}s "
-                f"(implied {implied_speed:.2f} m/s); re-anchoring"
+                f"step={dist:.3f}m over {time_diff:.3f}s; re-anchoring"
             )
             self._reset_odom_anchor(pos, current_time)
             return
 
-        self.speed = implied_speed
+        self.speed = dist / time_diff if time_diff > 0 else self.speed
         self.distance += dist
 
         if self.details.get('operation_mode') == self.AUTO:
