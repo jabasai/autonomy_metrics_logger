@@ -20,8 +20,8 @@ The node:
 3. Maintains a live `system_snapshot` dict with the latest values from each topic.
 4. Updates metrics on every odom step:
    - `distance` — total odometry distance (`autonomous_distance + manual_distance` by construction)
-   - `autonomous_distance` — distance accumulated while `/autonomous_mode == True`
-   - `manual_distance` — distance accumulated while `/autonomous_mode == False`
+   - `autonomous_distance` — distance accumulated while `/autonomous_mode == True` and Sentor reports `/robot_state == "enabled"` or `"active"`
+   - `manual_distance` — all other travelled distance
    - `incidents` — count of Auto → Manual transitions (the only thing MDBI is divided by)
    - `collision_incidents` — collision monitor only, separate from incidents
 5. Periodically (`db_metrics_period`, default 1 s) writes the latest counters to MongoDB. Worst-case loss on crash is `db_metrics_period` seconds of travel, plus any uncommitted partial odom step (≤ `min_distance_threshold`).
@@ -312,7 +312,7 @@ Use **either** `autonomous_mode` **or** `control_mode`, not both.
 
 The travelled distance is the source of truth for billing, so it gets special care:
 
-- **Dual accumulators**: every odom step contributes to either `autonomous_distance` or `manual_distance`. The total `distance` is `autonomous_distance + manual_distance` by construction.
+- **Dual accumulators**: every odom step contributes to either `autonomous_distance` or `manual_distance`. Autonomous distance requires both `/autonomous_mode == true` and Sentor to be enabled (`/robot_state == "enabled"` or `"active"`); all other states are manual. The total `distance` is `autonomous_distance + manual_distance` by construction.
 - **Debouncing**: `min_distance_threshold` (default 0.2 m) discards individual odom-to-odom deltas below the threshold, but the previous anchor `(x, y)` is **not** updated in that branch. This means accumulated motion is preserved exactly: tiny noise gets absorbed into the next real step rather than being thrown away.
 - **RELIABLE QoS** for `autonomous_mode` / `robot_state` / `control_mode` / `estop` so we never miss a mode-change message and mis-attribute distance.
 - **Periodic DB save** every `db_metrics_period` seconds plus immediate save on every event. Worst-case crash loss is bounded by that period.

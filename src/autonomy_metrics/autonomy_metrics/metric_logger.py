@@ -739,7 +739,11 @@ class AutonomyMetricsLogger(Node):
         self.speed = dist / time_diff if time_diff > 0 else self.speed
         self.distance += dist
 
-        if self.details.get('operation_mode') == self.AUTO:
+        # Bill distance as autonomous only when Sentor explicitly reports both
+        # autonomous mode and an enabled Sentor state.  The mode topic can
+        # remain true while the robot is disabled (or starting up), in which
+        # case movement must remain attributable to manual operation.
+        if self._is_sentor_autonomous_and_enabled():
             self.autonomous_distance += dist
         else:
             self.manual_distance += dist
@@ -771,6 +775,15 @@ class AutonomyMetricsLogger(Node):
         self.previous_time = stamp
         self.last_odom_update_time = stamp
         self.last_odom_msg_time = stamp
+
+    def _is_sentor_autonomous_and_enabled(self):
+        """Return whether Sentor permits distance to be billed as autonomous."""
+        return (
+            self.details.get('operation_mode') == self.AUTO
+            # ACTIVE is the operational child state of ENABLED in Sentor and
+            # must retain the autonomous attribution established at enable.
+            and self.details.get('robot_state') in {'enabled', 'active'}
+        )
 
     def autonomous_mode_role_callback(self, topic_name, msg):
         """
@@ -1124,6 +1137,48 @@ class AutonomyMetricsLogger(Node):
     # ----------------------------------------------------------------------
     # Sentor integration
     # ----------------------------------------------------------------------
+    def _sentor_failure_context(self, channel):
+        """Return the enriched failure reason(s) relevant to *channel*.
+
+        ``/sentor/active_failures`` contains both channel failures and monitor
+        failures.  A monitor failure applies to a channel when that channel is
+        listed in its ``channels`` field.  Preserve the full matching entries
+        for diagnosis while exposing a concise ``reason`` for event consumers.
+        """
+        failures = self.sentor_active_failures
+        if not isinstance(failures, list):
+            return {}
+
+        relevant = []
+        reasons = []
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+
+            channels = failure.get('channels', [])
+            if not isinstance(channels, (list, tuple, set)):
+                channels = []
+            applies_to_channel = (
+                failure.get('id') == channel
+                or channel in channels
+            )
+            if not applies_to_channel:
+                continue
+
+            relevant.append(failure)
+            # Description is Sentor's human-readable root cause.  Older or
+            # custom publishers may only supply a name, which is still useful.
+            reason = failure.get('description') or failure.get('name')
+            if isinstance(reason, str) and reason.strip() and reason not in reasons:
+                reasons.append(reason)
+
+        context = {}
+        if relevant:
+            context['failure_details'] = relevant
+        if reasons:
+            context['reason'] = '; '.join(reasons)
+        return context
+
     def sentor_channel_callback(self, topic_name, msg):
         """
         std_msgs/Bool on ``/<channel>/heartbeat``. True while every monitor
@@ -1154,6 +1209,10 @@ class AutonomyMetricsLogger(Node):
             'new_value': alive,
             'active_failures': self.sentor_active_failures,
         }
+        # Include Sentor's enriched root cause whenever the active-failures
+        # feed has it.  This applies to both warning and error channels.
+        if not alive:
+            extra.update(self._sentor_failure_context(channel))
 
         if alive:
             self.get_logger().info(f"[sentor_channel] '{channel}' recovered")
@@ -1164,7 +1223,11 @@ class AutonomyMetricsLogger(Node):
             })
             return
 
-        self.get_logger().warn(f"[sentor_channel] '{channel}' failed")
+        reason = extra.get('reason')
+        self.get_logger().warn(
+            f"[sentor_channel] '{channel}' failed"
+            + (f": {reason}" if reason else "")
+        )
         if cfg.get('count_incident', False):
             self.trigger_intervention(
                 cfg.get('event_type', f'Sentor_channel_failed_{channel}'),
@@ -1195,12 +1258,23 @@ class AutonomyMetricsLogger(Node):
         self.sentor_active_failures = failures
         self.system_snapshot['sentor_active_failures'] = failures
 
-        self.get_logger().info(f"[sentor_failures] {len(failures)} active failure(s)")
+        reasons = []
+        for failure in failures:
+            if not isinstance(failure, dict):
+                continue
+            reason = failure.get('description') or failure.get('name')
+            if isinstance(reason, str) and reason.strip() and reason not in reasons:
+                reasons.append(reason)
+        self.get_logger().info(
+            f"[sentor_failures] {len(failures)} active failure(s)"
+            + (f": {'; '.join(reasons)}" if reasons else "")
+        )
         self.log_event('Sentor_failures_changed', {
             **self.details,
             'topic': topic_name,
             'active_failures': failures,
             'prev_failures': prev,
+            **({'reason': '; '.join(reasons)} if reasons else {}),
             'system_snapshot': self.system_snapshot.copy(),
         })
 
