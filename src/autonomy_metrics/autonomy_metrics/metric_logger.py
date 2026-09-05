@@ -169,6 +169,12 @@ class AutonomyMetricsLogger(Node):
         self.declare_parameter('collision_time_window', 0.5)
         self.declare_parameter('collision_log_cooldown', 1.0)
 
+        # intervention_on_message topics (e.g. joystick activity) can publish
+        # continuously; without a cooldown every message would log an event
+        # and, while Autonomous, increment incidents. This is the default
+        # re-arm window, overridable per-topic via `cooldown` in the YAML.
+        self.declare_parameter('intervention_message_cooldown', 2.0)
+
         # Collision detection tuning (nav2 collision_detector state)
         self.declare_parameter('collision_detector_min_duration', 0.0)
         self.declare_parameter('collision_detector_clear_time', 1.0)
@@ -178,6 +184,7 @@ class AutonomyMetricsLogger(Node):
         self.collision_zero_threshold = self.get_parameter('collision_zero_threshold').get_parameter_value().double_value
         self.collision_time_window = self.get_parameter('collision_time_window').get_parameter_value().double_value
         self.collision_log_cooldown = self.get_parameter('collision_log_cooldown').get_parameter_value().double_value
+        self.intervention_message_cooldown = self.get_parameter('intervention_message_cooldown').get_parameter_value().double_value
         self.config_path = self.get_parameter('config_yaml').get_parameter_value().string_value
         self.mongo_host = self.get_parameter('mongodb_host').get_parameter_value().string_value
         self.mongo_port = self.get_parameter('mongodb_port').get_parameter_value().integer_value
@@ -224,6 +231,9 @@ class AutonomyMetricsLogger(Node):
         self.autonomous_time = 0.0
         self.autonomous_start_time = None
         self.details = {'estop': False, 'operation_mode': self.AUTO, 'robot_state': None}
+
+        # Per-topic last-trigger time for intervention_on_message debouncing
+        self.last_message_trigger_time = {}
 
         # Collision monitoring
         self.collision_incidents = 0
@@ -630,11 +640,21 @@ class AutonomyMetricsLogger(Node):
         # 1) any-message trigger
         msg_trig = cfg.get("intervention_on_message", {})
         if msg_trig.get("enable", False):
-            evt_type = msg_trig.get("event_type", f"{topic_name}_activity")
-            self.get_logger().info(
-                f"[Trigger] intervention_on_message on '{topic_name}' -> '{evt_type}'"
-            )
-            self.trigger_intervention(evt_type, extra={"topic": topic_name})
+            # Debounce: a continuously-publishing topic (e.g. a joystick relay
+            # that always emits at a fixed rate) must not log an event / count
+            # an incident on every single message. Re-arm only after cooldown.
+            cooldown = float(msg_trig.get("cooldown", self.intervention_message_cooldown))
+            now = self.get_clock().now()
+            last = self.last_message_trigger_time.get(topic_name)
+            elapsed = (now - last).nanoseconds * 1e-9 if last is not None else None
+
+            if elapsed is None or elapsed >= cooldown:
+                self.last_message_trigger_time[topic_name] = now
+                evt_type = msg_trig.get("event_type", f"{topic_name}_activity")
+                self.get_logger().info(
+                    f"[Trigger] intervention_on_message on '{topic_name}' -> '{evt_type}'"
+                )
+                self.trigger_intervention(evt_type, extra={"topic": topic_name})
 
         # 2) field-change trigger
         field_trigs = cfg.get("intervention_on_change", {})
