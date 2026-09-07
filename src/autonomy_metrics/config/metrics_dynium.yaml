@@ -60,7 +60,8 @@ topics:
     type: "std_msgs/msg/Bool"
     role: "autonomous_mode"
 
-  # "start-up" | "disabled" | "enabled" | "active"
+  # "start-up" | "disabled" | "enabled" | "active". Distance is counted
+  # as autonomous only when this is enabled/active and /autonomous_mode is true.
   - name: "/robot_state"
     type: "std_msgs/msg/String"
     role: "robot_state"

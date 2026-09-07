@@ -20,9 +20,9 @@ The node:
 3. Maintains a live `system_snapshot` dict with the latest values from each topic.
 4. Updates metrics on every odom step:
    - `distance` — total odometry distance (`autonomous_distance + manual_distance` by construction)
-   - `autonomous_distance` — distance accumulated while `/autonomous_mode == True`
-   - `manual_distance` — distance accumulated while `/autonomous_mode == False`
-   - `incidents` — count of Auto → Manual transitions (the only thing MDBI is divided by)
+   - `autonomous_distance` — distance accumulated while `/autonomous_mode == True` and Sentor reports `/robot_state == "enabled"` or `"active"`
+   - `manual_distance` — all other travelled distance
+   - `incidents` — count of Auto → Manual transitions, **plus** any other configured intervention (`EMS`, `Fault_shutdown`, `Joy_override`, `Teleradio_override`, `CAN_unhealthy`, `LIO_failed`, a `sentor_channel` with `count_incident: true`, etc.) that occurs while operation mode is `Autonomous` (this is the value MDBI is divided by)
    - `collision_incidents` — collision monitor only, separate from incidents
 5. Periodically (`db_metrics_period`, default 1 s) writes the latest counters to MongoDB. Worst-case loss on crash is `db_metrics_period` seconds of travel, plus any uncommitted partial odom step (≤ `min_distance_threshold`).
 6. Logs events to MongoDB **immediately** when they happen:
@@ -42,7 +42,9 @@ MDBI is computed as:
 > `mdbi = autonomous_distance / incidents`
 > (If `incidents == 0`, `mdbi = autonomous_distance`.)
 
-`incidents` here counts **only** Auto → Manual transitions. Collisions, robot-state changes, and other events are logged but do not feed MDBI.
+`incidents` counts every Auto → Manual transition (always, via `force_count=True`) **and** every other configured intervention/trigger event (`trigger_intervention(...)`) that happens while operation mode is `Autonomous` — i.e. any safety-relevant event that occurred without the robot ever actually giving up control. Robot-state changes and pure collision-monitor events are logged but do **not** feed MDBI; collisions are tracked separately in `collision_incidents`.
+
+`intervention_on_message` triggers (e.g. `Joy_override` on a continuously-publishing joystick topic) are debounced with a cooldown (`intervention_message_cooldown`, default 2 s, overridable per-topic via `cooldown` in the YAML) so a steady stream of messages logs/counts one incident per activity episode instead of one per message.
 
 ---
 
@@ -136,7 +138,7 @@ Environment variables used to tag the session:
 | `mdbi_logger/total_autonomous_distance`      | `std_msgs/Float32`  | default          | Distance travelled while `/autonomous_mode == true` (m).                   |
 | `mdbi_logger/total_manual_distance`          | `std_msgs/Float32`  | default          | Distance travelled while `/autonomous_mode == false` (m).                  |
 | `mdbi_logger/robot_speed`                    | `std_msgs/Float32`  | default          | Estimated speed (m/s); zeroed after `stop_timeout`.                        |
-| `mdbi_logger/total_incidents`                | `std_msgs/Int32`    | default          | Auto → Manual transition count (MDBI denominator).                         |
+| `mdbi_logger/total_incidents`                | `std_msgs/Int32`    | default          | MDBI-counted incidents (Auto → Manual transitions + other configured interventions while Autonomous). |
 | `mdbi_logger/total_collision_incidents`      | `std_msgs/Int32`    | default          | Collision monitor count.                                                   |
 | `mdbi_logger/db_health`                      | `std_msgs/Bool`     | latched (TL,1)   | `true` when DB writes are succeeding.                                      |
 | `mdbi_logger/db_health_reason`               | `std_msgs/String`   | latched (TL,1)   | `"ok"` or description of the current DB issue.                             |
@@ -160,6 +162,7 @@ All parameters are exposed through the launch file.
 | `enable_remote_logging`  | bool   | `false`       | Enable writes to remote MongoDB.                       |
 | `min_distance_threshold` | double | `0.2`         | Min odom step (m) required to count as movement (debounce — see Accuracy section). |
 | `stop_timeout`           | double | `2.0`         | Time (s) after last odom update before published speed is forced to 0. |
+| `intervention_message_cooldown` | double | `2.0` | Default re-arm window (s) for `intervention_on_message` triggers; prevents event/incident flooding from continuously-publishing topics. Overridable per-topic via `cooldown`. |
 
 ### DB resilience / cadence
 
@@ -303,7 +306,7 @@ Use **either** `autonomous_mode` **or** `control_mode`, not both.
 
 #### YAML-driven interventions
 
-- `intervention_on_message: {enable: true, event_type: "..."}` — every message triggers an event.
+- `intervention_on_message: {enable: true, event_type: "...", cooldown: <seconds, optional>}` — triggers once per activity episode, debounced by `cooldown` (falls back to the node's `intervention_message_cooldown` parameter, default 2 s) so a continuously-publishing topic doesn't log/count on every message.
 - `intervention_on_change: {<field>: {trigger_value: <opt>, event_type: "..."}}` — field-edge trigger.
 
 ---
@@ -312,7 +315,7 @@ Use **either** `autonomous_mode` **or** `control_mode`, not both.
 
 The travelled distance is the source of truth for billing, so it gets special care:
 
-- **Dual accumulators**: every odom step contributes to either `autonomous_distance` or `manual_distance`. The total `distance` is `autonomous_distance + manual_distance` by construction.
+- **Dual accumulators**: every odom step contributes to either `autonomous_distance` or `manual_distance`. Autonomous distance requires both `/autonomous_mode == true` and Sentor to be enabled (`/robot_state == "enabled"` or `"active"`); all other states are manual. The total `distance` is `autonomous_distance + manual_distance` by construction.
 - **Debouncing**: `min_distance_threshold` (default 0.2 m) discards individual odom-to-odom deltas below the threshold, but the previous anchor `(x, y)` is **not** updated in that branch. This means accumulated motion is preserved exactly: tiny noise gets absorbed into the next real step rather than being thrown away.
 - **RELIABLE QoS** for `autonomous_mode` / `robot_state` / `control_mode` / `estop` so we never miss a mode-change message and mis-attribute distance.
 - **Periodic DB save** every `db_metrics_period` seconds plus immediate save on every event. Worst-case crash loss is bounded by that period.
