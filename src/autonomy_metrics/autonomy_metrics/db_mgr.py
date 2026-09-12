@@ -57,6 +57,10 @@ class DatabaseMgr:
         )
         self.db = self.client[database_name]
         self.sessions_collection = self.db['sessions']
+        # Dedicated collection for ROS action calls, kept separate from the
+        # per-session document so it can grow independently and be queried
+        # / indexed on its own (one document per completed action call).
+        self.actions_collection = self.db['actions']
 
     def __repr__(self):
         return (
@@ -186,3 +190,22 @@ class DatabaseMgr:
             {"$push": {"battery_history": sample}},
         )
         return result.modified_count > 0
+
+    # ------------------------------------------------------------------
+    # ROS action call logging (separate collection)
+    # ------------------------------------------------------------------
+    def add_action_event(self, action_event):
+        """
+        Insert a completed-action document into the dedicated ``actions``
+        collection. Each document is tagged with the current ``session_id``
+        so action calls can be correlated back to their session, without
+        bloating the (single) session document.
+
+        Raises pymongo errors on failure; caller must handle.
+        """
+        self._require_session()
+        action_event = dict(action_event)
+        action_event.setdefault("session_id", self.session_id)
+        action_event = self._bson_safe(action_event)
+        result = self.actions_collection.insert_one(action_event)
+        return result.inserted_id

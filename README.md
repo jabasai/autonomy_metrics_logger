@@ -7,6 +7,7 @@
 - Is configured entirely via a YAML file (topics, fields, triggers, dynamic publishers).
 - Determines operation mode (`Autonomous` / `Manual`) from a `std_msgs/Bool` topic such as `/autonomous_mode`.
 - Tracks robot lifecycle state ("disabled" / "enabled" / "active") from a `std_msgs/String` topic such as `/robot_state`.
+- Logs configurable ROS 2 **action** calls (e.g. topological navigation) into a dedicated `actions` MongoDB collection, with start/end time, duration, outcome and result.
 - Is **resilient to MongoDB outages**: the node never crashes if Mongo is down, it retries connecting in the background, and it publishes its DB health on a latched topic. The travelled distance is the source of truth for billing, so accuracy and reliability are first-class concerns.
 
 ---
@@ -62,6 +63,13 @@ MDBI is computed as:
 - `mdbi_logger/db_health_reason` (`std_msgs/String`) — `"ok"` when healthy, otherwise a human-readable description like `"local: ServerSelectionTimeoutError: ..."`.
 
 Subscribers that join late always receive the latest value.
+
+### Collections
+
+- `robot_incidents.sessions` — one document per run (see below).
+- `robot_incidents.actions` — one document per completed, monitored ROS 2
+  action call, tagged with `session_id`. See section 8, "Action Call
+  Logging".
 
 ### Session document
 
@@ -355,7 +363,92 @@ ros2 launch autonomy_metrics autonomy_metrics.launch.py \
 
 ---
 
-## 8. Testing Tips
+## 8. Action Call Logging
+
+In addition to topics, the logger can monitor configurable **ROS 2 actions**
+(e.g. topological navigation, `nav2` behaviours, etc.) and record every
+completed call into its own MongoDB collection: `robot_incidents.actions`
+(same database as `sessions`, on every enabled DB — local and/or remote).
+
+### How it works
+
+The logger does **not** send goals itself; it observes goals sent by any
+other client, using only standard, public ROS 2 action interfaces:
+
+1. It subscribes to `<action_name>/_action/status` (`action_msgs/GoalStatusArray`)
+   to see every goal's lifecycle (accepted → executing → terminal state),
+   for **any** client, and records the wall-clock time a goal first appears
+   as the `start_time`.
+2. Optionally (`log_feedback: true`), it subscribes to
+   `<action_name>/_action/feedback` and keeps the most recent feedback
+   message per goal.
+3. When a goal reaches a terminal status (`SUCCEEDED`, `ABORTED`, `CANCELED`),
+   it records `end_time`/`duration_sec`/`outcome`, and queries the action's
+   standard `<action_name>/_action/get_result` service for that goal's
+   result — this is a first-class ROS 2 actions feature: any client that
+   knows the `goal_id` may request its result, not just the one that sent it.
+4. The resulting document is written once per completed action call to the
+   `actions` collection, tagged with the current `session_id` for
+   correlation with the session document.
+
+### Document shape
+
+```json
+{
+  "session_id": "...",
+  "action_name": "/topological_navigation/execute_policy_mode",
+  "action_type": "topological_navigation_msgs/action/GotoNode",
+  "goal_id": "3fa1...",
+  "start_time": "...",
+  "end_time": "...",
+  "duration_sec": 12.34,
+  "outcome": "SUCCEEDED",
+  "status_history": ["ACCEPTED", "EXECUTING", "SUCCEEDED"],
+  "result": { "success": true },
+  "last_feedback": { "feedback": "..." },
+  "caller": null,
+  "robot_name": "...",
+  "farm_name": "..."
+}
+```
+
+### Configuration
+
+```yaml
+actions:
+  - name: "/topological_navigation/execute_policy_mode"
+    type: "topological_navigation_msgs/action/GotoNode"
+    log_feedback: true   # optional, default false
+
+  - name: "/navigate_to_pose"
+    type: "nav2_msgs/action/NavigateToPose"
+```
+
+- `name` — the action's base name (as used by `ros2 action list`).
+- `type` — action type. Accepts `pkg/action/ActionName` or `pkg/ActionName`.
+- `log_feedback` (bool, default `false`) — subscribe to feedback and store
+  the last message alongside the result.
+
+### Known limitations
+
+- **Goal parameters**: ROS 2 actions do not publish the original goal
+  request anywhere (only `goal_id` and its acceptance timestamp are public);
+  capturing it generically would require the *calling* node to opt in to
+  ROS 2 service introspection. When `log_feedback` is enabled, the last
+  feedback message is stored as the closest available proxy for what a
+  goal was doing.
+- **Caller identity**: likewise not exposed by the action status/feedback
+  topics to third-party observers, so the `caller` field is currently
+  always `null`. It is kept in the schema for forward-compatibility should
+  ROS 2 (or the specific action) expose it in the future.
+- **Result availability**: if the action server does not keep the result
+  cached long enough, or the `get_result` service is not ready, `result`
+  will be `null` while the rest of the document (timing/outcome) is still
+  logged.
+
+---
+
+## 9. Testing Tips
 
 - Discover topics:
 
@@ -394,3 +487,8 @@ ros2 launch autonomy_metrics autonomy_metrics.launch.py \
   ```
 
 - Check the Mongo session document directly with `mongosh` against `robot_incidents.sessions`.
+- Check logged action calls with `mongosh` against `robot_incidents.actions`, e.g.:
+
+  ```bash
+  mongosh --eval 'db.actions.find().sort({start_time:-1}).limit(5)' robot_incidents
+  ```
