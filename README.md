@@ -370,10 +370,15 @@ In addition to topics, the logger can monitor configurable **ROS 2 actions**
 completed call into its own MongoDB collection: `robot_incidents.actions`
 (same database as `sessions`, on every enabled DB — local and/or remote).
 
+Requires **ROS 2 Iron/Jazzy or newer** for full goal-parameter capture (see
+"Goal parameters" below); status/feedback/result logging works on any
+distribution.
+
 ### How it works
 
-The logger does **not** send goals itself; it observes goals sent by any
-other client, using only standard, public ROS 2 action interfaces:
+The logger does **not** send goals itself; it only ever subscribes — it
+observes goals sent by any other client, using standard, public ROS 2
+action interfaces:
 
 1. It subscribes to `<action_name>/_action/status` (`action_msgs/GoalStatusArray`)
    to see every goal's lifecycle (accepted → executing → terminal state),
@@ -382,12 +387,23 @@ other client, using only standard, public ROS 2 action interfaces:
 2. Optionally (`log_feedback: true`), it subscribes to
    `<action_name>/_action/feedback` and keeps the most recent feedback
    message per goal.
-3. When a goal reaches a terminal status (`SUCCEEDED`, `ABORTED`, `CANCELED`),
+3. Optionally (`log_goal_request: true`, default), it subscribes to
+   `<action_name>/_action/send_goal/_service_event` — a plain **topic**.
+   Sending a goal is implemented internally as a call to the action's
+   `send_goal` *service*; ROS 2's "service introspection" feature
+   (Iron/Jazzy+) mirrors that service's request/response content onto this
+   topic whenever the calling client and/or the action server has it
+   enabled (`configure_introspection(..., contents=CONTENTS)`). We never
+   call the service ourselves — this is a passive topic subscription,
+   exactly like status/feedback — so the goal parameters are captured
+   for free whenever introspection is on, with zero coupling to the
+   specific caller.
+4. When a goal reaches a terminal status (`SUCCEEDED`, `ABORTED`, `CANCELED`),
    it records `end_time`/`duration_sec`/`outcome`, and queries the action's
    standard `<action_name>/_action/get_result` service for that goal's
    result — this is a first-class ROS 2 actions feature: any client that
    knows the `goal_id` may request its result, not just the one that sent it.
-4. The resulting document is written once per completed action call to the
+5. The resulting document is written once per completed action call to the
    `actions` collection, tagged with the current `session_id` for
    correlation with the session document.
 
@@ -404,13 +420,16 @@ other client, using only standard, public ROS 2 action interfaces:
   "duration_sec": 12.34,
   "outcome": "SUCCEEDED",
   "status_history": ["ACCEPTED", "EXECUTING", "SUCCEEDED"],
+  "goal_request": { "target": "WayPoint1" },
   "result": { "success": true },
   "last_feedback": { "feedback": "..." },
-  "caller": null,
   "robot_name": "...",
   "farm_name": "..."
 }
 ```
+
+`goal_request` is `null` unless a client or server for that action has
+service introspection enabled with `CONTENTS` (see "Goal parameters" below).
 
 ### Configuration
 
@@ -418,7 +437,8 @@ other client, using only standard, public ROS 2 action interfaces:
 actions:
   - name: "/topological_navigation/execute_policy_mode"
     type: "topological_navigation_msgs/action/GotoNode"
-    log_feedback: true   # optional, default false
+    log_feedback: true       # optional, default false
+    log_goal_request: true   # optional, default true
 
   - name: "/navigate_to_pose"
     type: "nav2_msgs/action/NavigateToPose"
@@ -428,23 +448,61 @@ actions:
 - `type` — action type. Accepts `pkg/action/ActionName` or `pkg/ActionName`.
 - `log_feedback` (bool, default `false`) — subscribe to feedback and store
   the last message alongside the result.
+- `log_goal_request` (bool, default `true`) — subscribe to the `send_goal`
+  service-introspection topic to capture goal parameters (see below). Set
+  to `false` to skip this subscription entirely.
+
+### Goal parameters
+
+ROS 2 actions send goals via an internal `send_goal` **service** call, not a
+topic, so goal parameters are not broadcast by default. However, ROS 2's
+built-in **service introspection** feature (available from Iron/Jazzy
+onwards) can mirror that service's request content onto a companion
+**topic**, `<action_name>/_action/send_goal/_service_event`. The logger
+subscribes to this topic (purely passive, like `status`/`feedback`) and
+extracts the goal fields from it into `goal_request` whenever a message
+appears there.
+
+For `goal_request` to be populated, introspection must be enabled by
+**the action client or the action server** for the `send_goal` service,
+with content capture, e.g. in the client:
+
+```python
+from rclpy.qos import qos_profile_services_default
+from rcl_interfaces.msg import ServiceEventInfo  # or via rclpy.action helpers
+
+self._action_client = ActionClient(self, GotoNode, 'topological_navigation/execute_policy_mode')
+self._action_client._client_handle.configure_introspection(
+    self.get_clock(),
+    qos_profile_services_default,
+    ServiceIntrospectionState.CONTENTS,
+)
+```
+
+(the exact API depends on the ROS 2 distribution/client library; see the
+[ROS 2 service introspection design doc](https://design.ros2.org/articles/services.html)
+and `ros2 service` / `ros2 action --introspect` tooling). If nothing
+enables introspection, `goal_request` simply stays `null` — the rest of
+the document (timing, outcome, result, feedback) is unaffected.
 
 ### Known limitations
 
-- **Goal parameters**: ROS 2 actions do not publish the original goal
-  request anywhere (only `goal_id` and its acceptance timestamp are public);
-  capturing it generically would require the *calling* node to opt in to
-  ROS 2 service introspection. When `log_feedback` is enabled, the last
-  feedback message is stored as the closest available proxy for what a
-  goal was doing.
-- **Caller identity**: likewise not exposed by the action status/feedback
-  topics to third-party observers, so the `caller` field is currently
-  always `null`. It is kept in the schema for forward-compatibility should
-  ROS 2 (or the specific action) expose it in the future.
+- **Goal parameters** require introspection to be enabled by the caller or
+  server, as described above; the logger cannot force this on. If
+  `log_goal_request` is enabled but nobody has turned on introspection,
+  `goal_request` is `null`.
+- **Caller identity**: not captured. The `send_goal` service-introspection
+  event only carries an anonymous, session-local `client_gid` (an RMW
+  identifier), not a human-readable node name, and there is no generic,
+  supported way to resolve that GID back to a node — so no `caller` field
+  is stored in the schema.
 - **Result availability**: if the action server does not keep the result
   cached long enough, or the `get_result` service is not ready, `result`
   will be `null` while the rest of the document (timing/outcome) is still
   logged.
+- Requires ROS 2 **Iron or newer** (service introspection support) for
+  `goal_request` capture; on older distributions this subscription is
+  skipped with a one-time warning and everything else still works.
 
 ---
 
