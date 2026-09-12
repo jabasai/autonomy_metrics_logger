@@ -115,3 +115,23 @@ topics:
   - name: "/gophar/motor_status/motor_1"
     type: "dynium_gophar_interfaces/msg/MotorStatus"
     log_all_fields: true
+
+# ---------------------------------------------------------
+# ROS 2 actions: log calls (start/end time, duration, outcome,
+# goal parameters when available, result and, if enabled, the last
+# feedback message) into a dedicated "actions" Mongo collection (both
+# local and remote, whichever DBs are enabled). See README section 8
+# for details, including how goal parameters are captured via ROS 2
+# service introspection (Iron/Jazzy+) and the caller-identity limitation.
+# ---------------------------------------------------------
+actions:
+  - name: "/topological_navigation/execute_policy_mode"
+    type: "topological_navigation_msgs/action/GotoNode"
+    log_feedback: true
+    log_goal_request: true   # capture goal params via service introspection
+
+  # Any other ROS2 action can be monitored the same way, e.g.:
+  # - name: "/navigate_to_pose"
+  #   type: "nav2_msgs/action/NavigateToPose"
+  #   log_feedback: false
+  #   log_goal_request: true

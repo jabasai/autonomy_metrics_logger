@@ -16,6 +16,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import (
     qos_profile_sensor_data,
+    qos_profile_action_status_default,
     QoSProfile,
     ReliabilityPolicy,
     DurabilityPolicy,
@@ -23,8 +24,39 @@ from rclpy.qos import (
 )
 
 from std_msgs.msg import Bool, Float32, Int32, String
+from action_msgs.msg import GoalStatus
+try:
+    # Service introspection (action goal requests are sent via the action's
+    # underlying `send_goal` *service*); only available on ROS 2 Iron/Jazzy+.
+    from service_msgs.msg import ServiceEventInfo
+except ImportError:
+    ServiceEventInfo = None
 
 from autonomy_metrics.db_mgr import DatabaseMgr as DBMgr
+
+
+# ---------------------------------------------------------------------------
+# Action status helpers
+# ---------------------------------------------------------------------------
+# action_msgs/msg/GoalStatus outcome codes -> human readable names, used when
+# logging action calls to Mongo.
+GOAL_STATUS_NAMES = {
+    GoalStatus.STATUS_UNKNOWN: 'UNKNOWN',
+    GoalStatus.STATUS_ACCEPTED: 'ACCEPTED',
+    GoalStatus.STATUS_EXECUTING: 'EXECUTING',
+    GoalStatus.STATUS_CANCELING: 'CANCELING',
+    GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
+    GoalStatus.STATUS_CANCELED: 'CANCELED',
+    GoalStatus.STATUS_ABORTED: 'ABORTED',
+}
+
+# Terminal statuses: once a goal reaches one of these it will not change
+# again, so this is when we finalise and log the action call.
+ACTION_TERMINAL_STATUSES = {
+    GoalStatus.STATUS_SUCCEEDED,
+    GoalStatus.STATUS_CANCELED,
+    GoalStatus.STATUS_ABORTED,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +109,25 @@ def import_msg_type(type_str: str):
         return getattr(module, cls_name)
     except Exception as e:
         raise ImportError(f"Failed to import message type '{type_str}': {e}")
+
+
+def import_action_type(type_str: str):
+    """Dynamically imports action types based on string, e.g.
+    'pkg/action/ActionName' or 'pkg/ActionName'."""
+    try:
+        parts = type_str.split('/')
+        if len(parts) == 2:
+            pkg, cls_name = parts
+            submodule = 'action'
+        elif len(parts) == 3:
+            pkg, submodule, cls_name = parts
+        else:
+            raise ValueError("Action type must be 'pkg/action/ActionName' or 'pkg/ActionName'")
+
+        module = import_module(f"{pkg}.{submodule}")
+        return getattr(module, cls_name)
+    except Exception as e:
+        raise ImportError(f"Failed to import action type '{type_str}': {e}")
 
 
 def get_nested_field(obj, path: str):
@@ -275,6 +326,17 @@ class AutonomyMetricsLogger(Node):
         self.dynamic_subs = []
         self.dynamic_publishers = {}
         self.topic_cfg_map = {}
+
+        # Action logging: config per action name, plus in-flight goal
+        # tracking (action_name -> {goal_id_hex -> tracking dict}) and the
+        # "get_result" service clients used to fetch the final result.
+        self.action_cfg_map = {}
+        self.action_state = {}
+        self.action_result_clients = {}
+        # Goal-request content observed via service introspection (see
+        # setup_actions()) that arrived before the corresponding status
+        # update created the tracking entry above: action_name -> {goal_id_hex: dict}
+        self.action_pending_goal_requests = {}
 
         # Cached env, used to retry init_session if Mongo was down at start
         self._session_env = None
@@ -593,6 +655,331 @@ class AutonomyMetricsLogger(Node):
 
             except Exception as e:
                 self.get_logger().error(f"Sub creation failed for {name}: {e}")
+
+        self.setup_actions()
+
+    def setup_actions(self):
+        """
+        Set up monitoring for configured ROS 2 actions (see YAML `actions:`).
+
+        Rather than becoming an active client that sends goals, this
+        subscribes to the action's standard, publicly available topics
+        so that goals sent by *any* client are observed:
+
+        - ``<name>/_action/status`` — goal lifecycle (always).
+        - ``<name>/_action/feedback`` — optional, via ``log_feedback``.
+        - ``<name>/_action/send_goal/_service_event`` — optional, via
+          ``log_goal_request``. Sending a goal is implemented as a call to
+          the action's underlying ``send_goal`` *service*; when ROS 2
+          "service introspection" (Iron/Jazzy+) is enabled for that
+          service by the calling client and/or the action server, its
+          request content (the goal parameters) is mirrored onto this
+          *topic*. We only ever subscribe to it — we neither call the
+          service nor require the caller to do anything special beyond
+          having introspection enabled — so the goal parameters can be
+          captured purely by listening, exactly like status/feedback.
+
+        The final result is fetched, for the given goal_id, via the
+        action's standard ``<name>/_action/get_result`` service - which any
+        client is allowed to query once it knows the goal_id (this is a
+        first-class ROS 2 actions feature enabling multiple observers per
+        goal).
+
+        Caveats:
+        - Goal parameters are only captured when the *caller* (or the
+          action server) has service introspection enabled with
+          ``CONTENTS`` for the ``send_goal`` service; if nobody has
+          enabled it, ``goal_request`` stays ``None``.
+        - Service introspection requires ROS 2 Iron/Jazzy or newer; the
+          generated ``.Event`` message type does not exist on older
+          distributions (e.g. Humble), in which case this is skipped with
+          a one-time warning.
+        - The identity of the calling node is still not reliably
+          recoverable this way (the introspection event only carries an
+          anonymous, session-local ``client_gid``, not a node name), so no
+          ``caller`` field is stored.
+        """
+        actions = self.config.get('actions', [])
+
+        for item in actions:
+            name = item.get('name')
+            type_str = item.get('type')
+
+            if not name or not type_str:
+                self.get_logger().warn(f"Skipping invalid action config: {item}")
+                continue
+
+            try:
+                action_cls = import_action_type(type_str)
+            except Exception as e:
+                self.get_logger().error(f"Action type import failed for {name}: {e}")
+                continue
+
+            self.action_cfg_map[name] = item
+            self.action_state[name] = {}
+
+            status_topic = f"{name}/_action/status"
+            try:
+                self.create_subscription(
+                    action_cls.Impl.GoalStatusMessage,
+                    status_topic,
+                    lambda msg, n=name: self.action_status_callback(n, msg),
+                    qos_profile_action_status_default,
+                )
+            except Exception as e:
+                self.get_logger().error(f"Action status subscription failed for {name}: {e}")
+                continue
+
+            if item.get('log_feedback', False):
+                feedback_topic = f"{name}/_action/feedback"
+                try:
+                    self.create_subscription(
+                        action_cls.Impl.FeedbackMessage,
+                        feedback_topic,
+                        lambda msg, n=name: self.action_feedback_callback(n, msg),
+                        qos_profile_sensor_data,
+                    )
+                except Exception as e:
+                    self.get_logger().error(f"Action feedback subscription failed for {name}: {e}")
+
+            if item.get('log_goal_request', True):
+                self._setup_action_goal_request_introspection(name, action_cls)
+
+            result_service = f"{name}/_action/get_result"
+            try:
+                result_cls = action_cls.Impl.GetResultService
+                client = self.create_client(result_cls, result_service)
+                self.action_result_clients[name] = (client, result_cls)
+            except Exception as e:
+                self.get_logger().error(f"Action result client creation failed for {name}: {e}")
+                self.action_result_clients[name] = None
+
+            self.get_logger().info(
+                f"Monitoring action: {name} (type={type_str}, "
+                f"log_feedback={bool(item.get('log_feedback', False))}, "
+                f"log_goal_request={bool(item.get('log_goal_request', True))})"
+            )
+
+    def _setup_action_goal_request_introspection(self, name, action_cls):
+        """
+        Subscribe (passively) to the service-introspection event topic for
+        this action's ``send_goal`` service, if the generated ``.Event``
+        type is available (requires ROS 2 Iron/Jazzy+). No-op with a
+        one-time warning otherwise.
+        """
+        if ServiceEventInfo is None:
+            self.get_logger().warn(
+                f"Action {name}: 'service_msgs' not available; goal-request "
+                "introspection (requires ROS 2 Iron/Jazzy+) is disabled."
+            )
+            return
+
+        event_cls = getattr(
+            getattr(action_cls.Impl, 'SendGoalService', None), 'Event', None
+        )
+        if event_cls is None:
+            self.get_logger().warn(
+                f"Action {name}: goal-request introspection event type not "
+                "generated for this action (requires ROS 2 Iron/Jazzy+ "
+                "service introspection support); goal parameters will not "
+                "be captured."
+            )
+            return
+
+        event_topic = f"{name}/_action/send_goal/_service_event"
+        try:
+            self.create_subscription(
+                event_cls,
+                event_topic,
+                lambda msg, n=name: self.action_goal_request_callback(n, msg),
+                STATE_QOS,
+            )
+            self.get_logger().info(
+                f"Action {name}: subscribed to {event_topic} "
+                "(only populated if a client or the server has service "
+                "introspection enabled with CONTENTS for this action's "
+                "send_goal service)"
+            )
+        except Exception as e:
+            self.get_logger().error(f"Action goal-request subscription failed for {name}: {e}")
+
+    def action_status_callback(self, action_name, msg):
+        """
+        Handle a `GoalStatusArray` update for a monitored action. Tracks the
+        start time on first sight of a goal_id, and finalises (fetches the
+        result and logs to Mongo) once the goal reaches a terminal status.
+        """
+        state_map = self.action_state.setdefault(action_name, {})
+
+        for status_msg in msg.status_list:
+            goal_id_msg = status_msg.goal_info.goal_id
+            goal_id_hex = bytes(goal_id_msg.uuid).hex()
+            status = status_msg.status
+            status_name = GOAL_STATUS_NAMES.get(status, str(status))
+
+            entry = state_map.get(goal_id_hex)
+            if entry is None:
+                pending_map = self.action_pending_goal_requests.get(action_name, {})
+                goal_request = pending_map.pop(goal_id_hex, None)
+                entry = {
+                    'goal_id': goal_id_hex,
+                    'start_time': datetime.now(tz=timezone.utc),
+                    'status_history': [],
+                    'last_feedback': None,
+                    'goal_request': goal_request,
+                    'finalized': False,
+                }
+                state_map[goal_id_hex] = entry
+
+            if not entry['status_history'] or entry['status_history'][-1] != status_name:
+                entry['status_history'].append(status_name)
+
+            if status in ACTION_TERMINAL_STATUSES and not entry['finalized']:
+                entry['finalized'] = True
+                entry['end_time'] = datetime.now(tz=timezone.utc)
+                entry['outcome'] = status_name
+                self.finalize_action(action_name, goal_id_hex, goal_id_msg)
+
+    def action_feedback_callback(self, action_name, msg):
+        """Store the most recent feedback for a goal, for later logging."""
+        try:
+            goal_id_hex = bytes(msg.goal_id.uuid).hex()
+        except Exception:
+            return
+
+        entry = self.action_state.setdefault(action_name, {}).get(goal_id_hex)
+        if entry is None:
+            return
+
+        try:
+            entry['last_feedback'] = ros_msg_to_dict(msg.feedback)
+        except Exception:
+            pass
+
+    def action_goal_request_callback(self, action_name, msg):
+        """
+        Handle a `send_goal` service-introspection event. Only carries goal
+        content when a client or server has enabled introspection with
+        `CONTENTS` for this action; otherwise this callback either never
+        fires (nobody publishing) or fires with an empty `request` list
+        (`METADATA`-only introspection).
+        """
+        info = getattr(msg, 'info', None)
+        if info is None or ServiceEventInfo is None:
+            return
+
+        # Only request events carry the goal fields; response events just
+        # carry the acceptance flag/stamp, which is already visible on the
+        # `status` topic.
+        if info.event_type not in (
+            ServiceEventInfo.REQUEST_SENT,
+            ServiceEventInfo.REQUEST_RECEIVED,
+        ):
+            return
+
+        requests = getattr(msg, 'request', None) or []
+        if not requests:
+            return
+
+        request = requests[0]
+        goal_id_field = getattr(request, 'goal_id', None)
+        if goal_id_field is None:
+            return
+
+        try:
+            goal_id_hex = bytes(goal_id_field.uuid).hex()
+            # The generated SendGoal request nests the actual goal fields
+            # under `.goal` (alongside `.goal_id`); unwrap it so
+            # `goal_request` mirrors just the action's Goal message.
+            goal_field = getattr(request, 'goal', None)
+            goal_request = ros_msg_to_dict(goal_field if goal_field is not None else request)
+        except Exception:
+            return
+        if goal_field is None and isinstance(goal_request, dict):
+            goal_request.pop('goal_id', None)
+
+        state_map = self.action_state.setdefault(action_name, {})
+        entry = state_map.get(goal_id_hex)
+        if entry is not None:
+            entry['goal_request'] = goal_request
+        else:
+            # The status update hasn't created the tracking entry yet;
+            # stash the request until the goal is first seen there.
+            self.action_pending_goal_requests.setdefault(action_name, {})[
+                goal_id_hex
+            ] = goal_request
+
+    def finalize_action(self, action_name, goal_id_hex, goal_id_msg):
+        """Best-effort fetch of the action result, then log the completed call."""
+        client_info = self.action_result_clients.get(action_name)
+        if not client_info or client_info[0] is None or not client_info[0].service_is_ready():
+            self.log_action_event(action_name, goal_id_hex, result=None)
+            return
+
+        client, result_cls = client_info
+        request = result_cls.Request()
+        request.goal_id = goal_id_msg
+
+        try:
+            future = client.call_async(request)
+        except Exception as e:
+            self.get_logger().warn(f"[Action] get_result call failed for {action_name}: {e}")
+            self.log_action_event(action_name, goal_id_hex, result=None)
+            return
+
+        def _on_result(fut, an=action_name, gid=goal_id_hex):
+            result_dict = None
+            try:
+                response = fut.result()
+                if response is not None:
+                    result_dict = ros_msg_to_dict(response.result)
+            except Exception as e:
+                self.get_logger().warn(f"[Action] get_result failed for {an}: {e}")
+            self.log_action_event(an, gid, result=result_dict)
+
+        future.add_done_callback(_on_result)
+
+    def log_action_event(self, action_name, goal_id_hex, result):
+        """Persist a completed action call into the `actions` Mongo collection."""
+        entry = self.action_state.get(action_name, {}).get(goal_id_hex)
+        if entry is None:
+            return
+
+        start_time = entry.get('start_time')
+        end_time = entry.get('end_time', datetime.now(tz=timezone.utc))
+        duration = (end_time - start_time).total_seconds() if start_time else None
+        cfg = self.action_cfg_map.get(action_name, {})
+
+        action_event = {
+            'action_name': action_name,
+            'action_type': cfg.get('type'),
+            'goal_id': goal_id_hex,
+            'start_time': start_time,
+            'end_time': end_time,
+            'duration_sec': duration,
+            'outcome': entry.get('outcome', 'UNKNOWN'),
+            'status_history': entry.get('status_history', []),
+            'goal_request': entry.get('goal_request'),
+            'result': result,
+            'last_feedback': entry.get('last_feedback'),
+            'robot_name': (self._session_env or {}).get('robot_name'),
+            'farm_name': (self._session_env or {}).get('farm_name'),
+        }
+
+        self.get_logger().info(
+            f"[Action] {action_name} goal={goal_id_hex[:8]} "
+            f"outcome={action_event['outcome']} "
+            f"duration={duration if duration is not None else 'n/a'}"
+        )
+
+        for label, dbm in (('local', self.db_mgr_local), ('remote', self.db_mgr_remote)):
+            if dbm is None or dbm.session_id is None:
+                continue
+            self._safe_db_call(label, dbm.add_action_event, action_event)
+
+        state_map = self.action_state.get(action_name)
+        if state_map is not None:
+            state_map.pop(goal_id_hex, None)
 
     # ----------------------------------------------------------------------
     # Snapshot helpers
